@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+
+<taglib xmlns="http://java.sun.com/xml/ns/j2ee"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://java.sun.com/xml/ns/j2ee http://java.sun.com/xml/ns/j2ee/web-jsptaglibrary_2_0.xsd"
+  version="2.0">
+    
+  <description>JSTL 1.1 functions library</description>
+  <display-name>JSTL functions</display-name>
+  <tlib-version>1.1</tlib-version>
+  <short-name>fe</short-name>
+  <uri>fess.tags.functions</uri>
+  
+  <function>
+    <description>
+      Print HTML tag.
+    </description>
+    <name>html</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.lang.String html(boolean)</function-signature>
+    <example>
+      ${fe:html(true)}...${fe:html(false)}
+    </example>
+  </function>
+
+  <function>
+    <description>
+      Returns Date from a given value.
+    </description>
+    <name>date</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.util.Date date(java.lang.Long)</function-signature>
+    <example>
+      ${fe:date(doc.tstamp)}
+    </example>
+  </function>
+
+  <function>
+    <description>
+      Returns formatted date from a given value.
+    </description>
+    <name>formatDate</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.lang.String formatDate(java.time.ZonedDateTime, java.lang.String)</function-signature>
+    <example>
+      ${fe:formatDate(d, 'yyyy')}
+    </example>
+  </function>
+
+  <function>
+    <description>
+      Returns base64 encoded value.
+    </description>
+    <name>base64</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.lang.String base64(java.lang.String)</function-signature>
+    <example>
+      ${fe:base64(value)}
+    </example>
+  </function>
+
+  <function>
+    <description>
+      Check if a file exists.
+    </description>
+    <name>fileExists</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>boolean fileExists(java.lang.String)</function-signature>
+    <example>
+      ${fe:fileExists(path)}
+    </example>
+  </function>
+
+  <function>
+    <description>Calculates URL.</description>
+    <name>url</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.lang.String url(java.lang.String)</function-signature>
+    <example>&lt;a href="${fe:url(param:info)}" ...</example>
+  </function>
+
+  <function>
+    <description>
+      Returns the URL of a document when it can be the href of a link (a relative URL, or one whose scheme
+      is http, https, ftp, ftps, file, smb, smb1, storage, s3 or gcs), otherwise "#". Not HTML-escaped.
+    </description>
+    <name>safeHref</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.lang.String safeHref(java.lang.String)</function-signature>
+    <example>&lt;a href="${f:h(fe:safeHref(doc.url_link))}" ...</example>
+  </function>
+
+  <function>
+    <description>
+      Returns a string resulting from replacing in an input string all occurrences
+      of a "before" string into an "after" substring.
+    </description>
+    <name>replace</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>java.lang.String replace(java.lang.Object, java.lang.String, java.lang.String)</function-signature>
+    <example>${fe:replace(input, regex, replacement)}</example>
+  </function>
+
+  <function>
+    <description>Check if user has a permission.</description>
+    <name>permission</name>
+    <function-class>org.codelibs.fess.taglib.FessFunctions</function-class>
+    <function-signature>boolean hasActionRole(java.lang.String)</function-signature>
+    <example>${fe:permission("admin-dashboard")}</example>
+  </function>
+</taglib>

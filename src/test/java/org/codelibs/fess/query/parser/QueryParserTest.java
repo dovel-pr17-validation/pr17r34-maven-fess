@@ -1,0 +1,164 @@
+/*
+ * Copyright 2012-2025 CodeLibs Project and the Others.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+package org.codelibs.fess.query.parser;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import java.util.List;
+
+import org.apache.lucene.queryparser.classic.ParseException;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanClause.Occur;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BoostQuery;
+import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.PhraseQuery;
+import org.apache.lucene.search.PrefixQuery;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.RegexpQuery;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.WildcardQuery;
+import org.codelibs.fess.exception.QueryParseException;
+import org.codelibs.fess.unit.UnitFessTestCase;
+import org.junit.jupiter.api.Test;
+
+public class QueryParserTest extends UnitFessTestCase {
+
+    @Test
+    public void test_regexThatCompiles_isARegexpQuery() {
+        final QueryParser queryParser = new QueryParser();
+        queryParser.init();
+        final Query query = queryParser.parse("title:/fe.*s/");
+        assertEquals(RegexpQuery.class, query.getClass());
+        assertEquals("title", ((RegexpQuery) query).getField());
+    }
+
+    @Test
+    public void test_regexThatDoesNotCompile_isAQueryParseException() {
+        // The Lucene parser compiles a /regular expression/ while it reads it, and a pattern that
+        // does not compile used to leave as an IllegalArgumentException, so a caller that refuses a
+        // query it cannot parse (QueryHelper) did not recognize it and the request failed with a 500.
+        final QueryParser queryParser = new QueryParser();
+        queryParser.init();
+        for (final String query : new String[] { "/[a/", "/(a/", "/a{/", "/a{2,1}/", "/a)/", "title:/[/", "fess OR /[a-/" }) {
+            final QueryParseException e = assertThrows(QueryParseException.class, () -> queryParser.parse(query), query);
+            assertTrue(e.getCause() instanceof ParseException, query);
+            assertTrue(e.getCause().getMessage().contains("Cannot parse '" + query + "'"), e.getCause().getMessage());
+            assertTrue(e.getCause().getCause() instanceof IllegalArgumentException, query);
+        }
+    }
+
+    @Test
+    public void test_aFailureOfTheParserSetupIsNotAQueryParseException() {
+        final QueryParser queryParser = new QueryParser() {
+            @Override
+            protected org.apache.lucene.queryparser.classic.QueryParser createQueryParser() {
+                throw new IllegalArgumentException("broken setup");
+            }
+        };
+        queryParser.init();
+        assertThrows(IllegalArgumentException.class, () -> queryParser.parse("fess"));
+    }
+
+    @Test
+    public void test_LuceneQueryParser() {
+        QueryParser queryParser = new QueryParser();
+
+        Query query = queryParser.createDefaultFilterChain().parse("fess");
+        assertEquals(TermQuery.class, query.getClass());
+        assertEquals("_default:fess", ((TermQuery) query).getTerm().toString());
+
+        query = queryParser.createDefaultFilterChain().parse("title:fess");
+        assertEquals(TermQuery.class, query.getClass());
+        assertEquals("title:fess", ((TermQuery) query).getTerm().toString());
+
+        query = queryParser.createDefaultFilterChain().parse("fess*");
+        assertEquals(PrefixQuery.class, query.getClass());
+        assertEquals("_default:fess", ((PrefixQuery) query).getPrefix().toString());
+
+        query = queryParser.createDefaultFilterChain().parse("fe?s");
+        assertEquals(WildcardQuery.class, query.getClass());
+        assertEquals("_default:fe?s", ((WildcardQuery) query).getTerm().toString());
+
+        query = queryParser.createDefaultFilterChain().parse("fess~");
+        assertEquals(FuzzyQuery.class, query.getClass());
+        assertEquals("_default:fess", ((FuzzyQuery) query).getTerm().toString());
+
+        query = queryParser.createDefaultFilterChain().parse("fess^10");
+        assertEquals(BoostQuery.class, query.getClass());
+        assertEquals("_default:fess", ((BoostQuery) query).getQuery().toString());
+        assertEquals(10.0f, ((BoostQuery) query).getBoost());
+
+        // a quoted single word is a one-term phrase, so no implicit fuzzy clause is added for it
+        query = queryParser.createDefaultFilterChain().parse("\"fess\"");
+        assertEquals(PhraseQuery.class, query.getClass());
+        assertEquals("_default:fess", ((PhraseQuery) query).getTerms()[0].toString());
+
+        query = queryParser.createDefaultFilterChain().parse("\"fess codelibs\"");
+        assertEquals(PhraseQuery.class, query.getClass());
+        assertEquals("_default:fess", ((PhraseQuery) query).getTerms()[0].toString());
+        assertEquals("_default:codelibs", ((PhraseQuery) query).getTerms()[1].toString());
+        assertEquals(0, ((PhraseQuery) query).getSlop());
+
+        query = queryParser.createDefaultFilterChain().parse("\"fess codelibs\"~5");
+        assertEquals(PhraseQuery.class, query.getClass());
+        assertEquals("_default:fess", ((PhraseQuery) query).getTerms()[0].toString());
+        assertEquals("_default:codelibs", ((PhraseQuery) query).getTerms()[1].toString());
+        assertEquals(5, ((PhraseQuery) query).getSlop());
+
+        query = queryParser.createDefaultFilterChain().parse("fess codelibs");
+        assertEquals(BooleanQuery.class, query.getClass());
+        List<BooleanClause> clauses = ((BooleanQuery) query).clauses();
+        assertEquals(TermQuery.class, clauses.get(0).query().getClass());
+        assertEquals("_default:fess", clauses.get(0).query().toString());
+        assertEquals(Occur.MUST, clauses.get(0).occur());
+        assertEquals(TermQuery.class, clauses.get(1).query().getClass());
+        assertEquals("_default:codelibs", clauses.get(1).query().toString());
+        assertEquals(Occur.MUST, clauses.get(1).occur());
+
+        query = queryParser.createDefaultFilterChain().parse("fess AND codelibs");
+        assertEquals(BooleanQuery.class, query.getClass());
+        clauses = ((BooleanQuery) query).clauses();
+        assertEquals(TermQuery.class, clauses.get(0).query().getClass());
+        assertEquals("_default:fess", clauses.get(0).query().toString());
+        assertEquals(Occur.MUST, clauses.get(0).occur());
+        assertEquals(TermQuery.class, clauses.get(1).query().getClass());
+        assertEquals("_default:codelibs", clauses.get(1).query().toString());
+        assertEquals(Occur.MUST, clauses.get(1).occur());
+
+        query = queryParser.createDefaultFilterChain().parse("fess OR codelibs");
+        assertEquals(BooleanQuery.class, query.getClass());
+        clauses = ((BooleanQuery) query).clauses();
+        assertEquals(TermQuery.class, clauses.get(0).query().getClass());
+        assertEquals("_default:fess", clauses.get(0).query().toString());
+        assertEquals(Occur.SHOULD, clauses.get(0).occur());
+        assertEquals(TermQuery.class, clauses.get(1).query().getClass());
+        assertEquals("_default:codelibs", clauses.get(1).query().toString());
+        assertEquals(Occur.SHOULD, clauses.get(1).occur());
+
+        query = queryParser.createDefaultFilterChain().parse("\"fess\" codelibs");
+        assertEquals(BooleanQuery.class, query.getClass());
+        clauses = ((BooleanQuery) query).clauses();
+        assertEquals(PhraseQuery.class, clauses.get(0).query().getClass());
+        assertEquals("_default:fess", ((PhraseQuery) clauses.get(0).query()).getTerms()[0].toString());
+        assertEquals(Occur.MUST, clauses.get(0).occur());
+        assertEquals(TermQuery.class, clauses.get(1).query().getClass());
+        assertEquals("_default:codelibs", clauses.get(1).query().toString());
+        assertEquals(Occur.MUST, clauses.get(1).occur());
+
+    }
+
+}

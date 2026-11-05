@@ -1,0 +1,404 @@
+/*
+ * Copyright 2012-2025 CodeLibs Project and the Others.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+package org.codelibs.fess.app.web.base;
+
+import static org.codelibs.core.stream.StreamUtil.split;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.codelibs.core.lang.StringUtil;
+import org.codelibs.fess.Constants;
+import org.codelibs.fess.app.web.admin.AdminAction;
+import org.codelibs.fess.exception.UserRoleLoginException;
+import org.codelibs.fess.helper.CrawlingConfigHelper;
+import org.codelibs.fess.helper.PermissionHelper;
+import org.codelibs.fess.util.ComponentUtil;
+import org.dbflute.optional.OptionalEntity;
+import org.dbflute.optional.OptionalThing;
+import org.lastaflute.di.util.LdiFileUtil;
+import org.lastaflute.web.login.LoginManager;
+import org.lastaflute.web.response.ActionResponse;
+import org.lastaflute.web.response.StreamResponse;
+import org.lastaflute.web.ruts.process.ActionRuntime;
+import org.lastaflute.web.util.LaServletContextUtil;
+import org.lastaflute.web.validation.VaErrorHook;
+
+import jakarta.annotation.Resource;
+import jakarta.servlet.ServletContext;
+
+/**
+ * Base action class for admin pages in Fess.
+ * <p>
+ * This abstract class provides common functionality for all admin actions,
+ * including authentication, authorization, and HTML data setup.
+ * </p>
+ *
+ */
+public abstract class FessAdminAction extends FessBaseAction {
+
+    private static final Logger logger = LogManager.getLogger(FessAdminAction.class);
+
+    /** Constant suffix for view names. */
+    public static final String VIEW = "-view";
+
+    /**
+     * Default constructor.
+     */
+    public FessAdminAction() {
+    }
+
+    // ===================================================================================
+    //                                                                           Attribute
+    //                                                                           =========
+    /** Helper for crawling configuration management. */
+    @Resource
+    protected CrawlingConfigHelper crawlingConfigHelper;
+
+    // ===================================================================================
+    //                                                                        Small Helper
+    //                                                                        ============
+
+    /**
+     * Sets up HTML data for admin pages.
+     * <p>
+     * This method configures common data needed for admin pages including
+     * editable flags, user roles, and forum links.
+     * </p>
+     *
+     * @param runtime the action runtime context
+     */
+    @Override
+    protected void setupHtmlData(final ActionRuntime runtime) {
+        super.setupHtmlData(runtime);
+        systemHelper.setupAdminHtmlData(this, runtime);
+
+        final Boolean editable =
+                getUserBean().map(user -> user.hasRoles(fessConfig.getAuthenticationAdminRolesAsArray()) || user.hasRole(getActionRole()))
+                        .orElse(false);
+        runtime.registerData("editable", editable);
+        runtime.registerData("editableClass", editable ? StringUtil.EMPTY : "disabled");
+        runtime.registerData("fesenType", fessConfig.getFesenType());
+        runtime.registerData("fesenPluginless", fessConfig.isFesenPluginless());
+        final String forumLink = systemHelper.getForumLink();
+        if (StringUtil.isNotBlank(forumLink)) {
+            runtime.registerData("forumLink", forumLink);
+        }
+    }
+
+    /**
+     * Get the action role.
+     * @return The action role.
+     */
+    protected abstract String getActionRole();
+
+    /**
+     * Streams a CSV file in the CSV encoding of the configuration, with a byte order mark for UTF-8 so
+     * that Excel reads it as UTF-8. The size is not known and not limited, so nothing is buffered
+     * beyond the writer. A failure to read the data is rethrown, so the browser gets an error instead
+     * of a file that looks complete; a failure to write means the client is gone and is only logged.
+     *
+     * @param fileName the name of the downloaded file
+     * @param writeCall writes the CSV
+     * @return the stream response
+     */
+    protected StreamResponse asCsvStream(final String fileName, final CsvWriteCall writeCall) {
+        final String encoding = fessConfig.getCsvFileEncoding();
+        return asStream(fileName).contentTypeOctetStream().stream(out -> {
+            // not closed: the container owns the response stream
+            final Writer writer = new BufferedWriter(new OutputStreamWriter(out.stream(), encoding));
+            try {
+                if (Constants.UTF_8.equalsIgnoreCase(encoding)) {
+                    writer.write('\uFEFF');
+                }
+                writeCall.write(writer);
+                writer.flush();
+            } catch (final IOException e) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Failed to write {} to the response.", fileName, e);
+                }
+            }
+        });
+    }
+
+    /**
+     * Writes the content of a CSV download.
+     */
+    @FunctionalInterface
+    protected interface CsvWriteCall {
+        /**
+         * Writes the CSV.
+         *
+         * @param writer the writer of the response
+         * @throws IOException if writing fails
+         */
+        void write(Writer writer) throws IOException;
+    }
+
+    /**
+     * Writes data to the specified file path.
+     *
+     * @param path the file path to write to
+     * @param data the data to write
+     */
+    protected void write(final String path, final byte[] data) {
+        validateFilePath(path);
+        LdiFileUtil.write(path, data);
+    }
+
+    /**
+     * Validates the file path.
+     *
+     * @param path the file path to validate
+     */
+    protected void validateFilePath(final String path) {
+        if (StringUtil.isBlank(path)) {
+            throw new IllegalArgumentException("File path cannot be blank.");
+        }
+        try {
+            final Path filePath = Paths.get(path).normalize();
+            final String normalizedPath = filePath.toString();
+            if (normalizedPath.contains("..")) {
+                throw new IllegalArgumentException("Invalid file path: path=" + path);
+            }
+            final File file = filePath.toFile();
+            final String canonicalPath = file.getCanonicalPath();
+            final String[] allowedPathProperties = { "fess.var.path", "fess.webapp.path", "fess.conf.path" };
+            boolean isAllowed = false;
+            final List<String> allowedPaths = new ArrayList<>();
+            for (final String prop : allowedPathProperties) {
+                final String basePath = System.getProperty(prop);
+                if (basePath != null) {
+                    final String baseCanonicalPath = new File(basePath).getCanonicalPath();
+                    allowedPaths.add(baseCanonicalPath);
+                    if (canonicalPath.startsWith(baseCanonicalPath)) {
+                        isAllowed = true;
+                        break;
+                    }
+                }
+            }
+            if (!allowedPaths.isEmpty() && !isAllowed) {
+                throw new IllegalArgumentException(
+                        "File path is outside allowed directory: path=" + canonicalPath + ", allowed=" + allowedPaths);
+            }
+        } catch (final IOException e) {
+            throw new IllegalArgumentException("Invalid file path: path=" + path, e);
+        }
+    }
+
+    /**
+     * Gets the servlet context.
+     *
+     * @return the servlet context
+     */
+    protected ServletContext getServletContext() {
+        return LaServletContextUtil.getServletContext();
+    }
+
+    /**
+     * Verifies that the CRUD mode matches the expected mode.
+     *
+     * @param crudMode the actual CRUD mode
+     * @param expectedMode the expected CRUD mode
+     * @param errorHook the error hook to call if verification fails
+     */
+    protected void verifyCrudMode(final int crudMode, final int expectedMode, final VaErrorHook errorHook) {
+        if (crudMode != expectedMode) {
+            throwValidationError(messages -> {
+                messages.addErrorsCrudInvalidMode(GLOBAL, String.valueOf(expectedMode), String.valueOf(crudMode));
+            }, errorHook);
+        }
+    }
+
+    /**
+     * Verifies that the entity of a details, edit or duplicate page exists.
+     * <p>
+     * The check has to be made by the action method. A validation error thrown inside the setup of
+     * the form given to {@code useForm} is thrown while the response is written, where LastaFlute
+     * reports it as a failure to create the form (HTTP 500) instead of showing the error hook.
+     * </p>
+     *
+     * @param <ENTITY> the type of the entity
+     * @param entity the entity that was looked up
+     * @param id the ID of the entity as the user knows it, for the message
+     * @param errorHook the error hook to call if the entity does not exist
+     * @return the entity that was looked up
+     */
+    protected <ENTITY> OptionalEntity<ENTITY> verifyFound(final OptionalEntity<ENTITY> entity, final String id,
+            final VaErrorHook errorHook) {
+        if (!entity.isPresent()) {
+            throwValidationError(messages -> messages.addErrorsCrudCouldNotFindCrudTable(GLOBAL, id), errorHook);
+        }
+        return entity;
+    }
+
+    /**
+     * Encodes permission strings into an array.
+     *
+     * @param permissionsText the permissions text (newline-separated)
+     * @return encoded permission array
+     */
+    protected static String[] encodePermissions(final String permissionsText) {
+        final PermissionHelper permissionHelper = ComponentUtil.getPermissionHelper();
+        return split(permissionsText, "\n")
+                .get(stream -> stream.map(permissionHelper::encode).filter(StringUtil::isNotBlank).distinct().toArray(String[]::new));
+    }
+
+    // ===================================================================================
+    //                                                                            Document
+    //                                                                            ========
+    /**
+     * {@inheritDoc} <br>
+     * Application Origin Methods:
+     * <pre>
+     * <span style="font-size: 130%; color: #553000">[Small Helper]</span>
+     * o saveInfo() <span style="color: #3F7E5E">// save messages to session</span>
+     * o write() <span style="color: #3F7E5E">// write text to specified file</span>
+     * o copyBeanToBean() <span style="color: #3F7E5E">// copy bean to bean by BeanUtil</span>
+     * o getServletContext() <span style="color: #3F7E5E">// get servlet context</span>
+     * </pre>
+     */
+    @Override
+    public void document1_CallableSuperMethod() {
+        super.document1_CallableSuperMethod();
+    }
+
+    // ===================================================================================
+    //                                                                           User Info
+    //                                                                           =========
+    /**
+     * Gets the login manager for this admin action.
+     *
+     * @return the login manager wrapped in OptionalThing
+     */
+    @Override
+    protected OptionalThing<LoginManager> myLoginManager() {
+        return OptionalThing.of(fessLoginAssist);
+    }
+
+    // ===================================================================================
+    //                                                                               Hook
+    //                                                                              ======
+    /**
+     * Handles the prologue phase of action execution.
+     * <p>
+     * This method catches UserRoleLoginException and redirects to the
+     * application root.
+     * </p>
+     *
+     * @param runtime the action runtime context
+     * @return the action response, or redirect response if login exception occurs
+     */
+    @Override
+    public ActionResponse godHandPrologue(final ActionRuntime runtime) {
+        try {
+            return superGodHandPrologue(runtime);
+        } catch (final UserRoleLoginException e) {
+            activityHelper.accessDenied(getUserBean(), runtime.getRequestPath());
+            return redirectToRoot();
+        }
+    }
+
+    /**
+     * Calls the parent's godHandPrologue method.
+     * <p>
+     * This method exists to allow subclasses or tests to override
+     * the behavior of the parent class invocation.
+     * </p>
+     *
+     * @param runtime the action runtime context
+     * @return the action response from the parent
+     */
+    protected ActionResponse superGodHandPrologue(final ActionRuntime runtime) {
+        return super.godHandPrologue(runtime);
+    }
+
+    /**
+     * Keeps the page number of a list screen inside the search engine's result window
+     * ({@code indexer.max.result.window.size}).
+     * <p>
+     * A page that would end beyond the window can never be answered by the search engine, so
+     * asking for it fails the whole request. It is replaced by the last page inside the window,
+     * the way the document report screen and the admin API do.
+     * </p>
+     *
+     * @param pageNumber the page number as it was requested
+     * @param pageSize the number of rows on a page
+     * @return the page number, or the last page inside the window if it is beyond it
+     */
+    protected int limitPageNumber(final int pageNumber, final int pageSize) {
+        final int maxPage = Math.max(1, fessConfig.getIndexerMaxResultWindowSizeAsInteger() / Math.max(1, pageSize));
+        return Math.min(pageNumber, maxPage);
+    }
+
+    /**
+     * Checks whether this action works only with the CodeLibs plugins of the search engine.
+     * <p>
+     * When it does and the search engine runs without them ({@code FessConfig#isFesenPluginless()}),
+     * {@link #hookBefore(ActionRuntime)} redirects to the admin top instead of running the action.
+     * </p>
+     *
+     * @return true if the action needs the CodeLibs plugins; false by default
+     */
+    protected boolean requiresEnginePlugins() {
+        return false;
+    }
+
+    /**
+     * Hook method called before action execution.
+     * <p>
+     * This method logs user access activity for the current request. It runs after
+     * {@link #godHandPrologue(ActionRuntime)}, so the role checks have already been made when an
+     * action that {@link #requiresEnginePlugins() requires the plugins} is turned away.
+     * </p>
+     *
+     * @param runtime the action runtime context
+     * @return the action response from the parent hook
+     */
+    @Override
+    public ActionResponse hookBefore(final ActionRuntime runtime) {
+        final String requestPath = runtime.getRequestPath();
+        final String executeName = runtime.getExecuteMethod().getName();
+        activityHelper.access(getUserBean(), requestPath, executeName);
+        if (requiresEnginePlugins() && fessConfig.isFesenPluginless()) {
+            return redirect(AdminAction.class);
+        }
+        return super.hookBefore(runtime);
+    }
+
+    /**
+     * Hook method called after action execution completes.
+     * <p>
+     * This method performs cleanup operations by calling the parent hook.
+     * </p>
+     *
+     * @param runtime the action runtime context
+     */
+    @Override
+    public void hookFinally(final ActionRuntime runtime) {
+        super.hookFinally(runtime);
+    }
+
+}

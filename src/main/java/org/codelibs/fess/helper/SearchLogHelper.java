@@ -1,0 +1,1001 @@
+/*
+ * Copyright 2012-2025 CodeLibs Project and the Others.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+package org.codelibs.fess.helper;
+
+import static org.codelibs.core.stream.StreamUtil.stream;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.codelibs.core.concurrent.CommonPoolUtil;
+import org.codelibs.core.lang.StringUtil;
+import org.codelibs.fess.Constants;
+import org.codelibs.fess.entity.SearchLogEvent;
+import org.codelibs.fess.entity.SearchRequestParams;
+import org.codelibs.fess.entity.SearchRequestParams.SearchRequestType;
+import org.codelibs.fess.mylasta.action.FessUserBean;
+import org.codelibs.fess.mylasta.direction.FessConfig;
+import org.codelibs.fess.opensearch.log.exbhv.ChatLogBhv;
+import org.codelibs.fess.opensearch.log.exbhv.ClickLogBhv;
+import org.codelibs.fess.opensearch.log.exbhv.FavoriteLogBhv;
+import org.codelibs.fess.opensearch.log.exbhv.SearchLogBhv;
+import org.codelibs.fess.opensearch.log.exbhv.UserInfoBhv;
+import org.codelibs.fess.opensearch.log.exentity.ChatLog;
+import org.codelibs.fess.opensearch.log.exentity.ClickLog;
+import org.codelibs.fess.opensearch.log.exentity.SearchLog;
+import org.codelibs.fess.opensearch.log.exentity.UserInfo;
+import org.codelibs.fess.util.ComponentUtil;
+import org.codelibs.fess.util.DocumentUtil;
+import org.codelibs.fess.util.QueryResponseList;
+import org.dbflute.optional.OptionalEntity;
+import org.dbflute.optional.OptionalThing;
+import org.lastaflute.web.util.LaRequestUtil;
+import org.codelibs.fesen.opensearch.action.update.UpdateRequest;
+import org.codelibs.fesen.opensearch.script.Script;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import com.google.common.base.CaseFormat;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.servlet.http.HttpServletRequest;
+
+/**
+ * Helper class for managing search logs.
+ */
+public class SearchLogHelper {
+
+    /**
+     * Upper bound for the 1-based click rank; aligns with OpenSearch default {@code index.max_result_window}.
+     * Larger values are not recorded (and are rejected by the v2 click API) to limit analytics forgery.
+     */
+    public static final int MAX_CLICK_RANK = 10000;
+
+    private static final Logger logger = LogManager.getLogger(SearchLogHelper.class);
+
+    /**
+     * Default constructor for SearchLogHelper.
+     */
+    public SearchLogHelper() {
+        // Default constructor
+    }
+
+    /** Interval for checking user information in milliseconds (default: 10 minutes). */
+    protected long userCheckInterval = 10 * 60 * 1000L; // 10 min
+
+    /** Maximum size of the user information cache. */
+    protected int userInfoCacheSize = 10000;
+
+    /** Queue for storing search logs. */
+    protected Queue<SearchLog> searchLogQueue = new ConcurrentLinkedQueue<>();
+
+    /** Queue for storing click logs. */
+    protected Queue<ClickLog> clickLogQueue = new ConcurrentLinkedQueue<>();
+
+    /** Queue for storing chat logs. */
+    protected Queue<ChatLog> chatLogQueue = new ConcurrentLinkedQueue<>();
+
+    /** Cache for storing user information. */
+    protected LoadingCache<String, UserInfo> userInfoCache;
+
+    /** Name of the logger for search logs. */
+    protected String loggerName = "fess.log.searchlog";
+
+    /** Logger for search logs. */
+    protected Logger searchLogLogger = null;
+
+    /** ObjectMapper for JSON processing. */
+    protected ObjectMapper objectMapper = new ObjectMapper();
+
+    /**
+     * Initializes the SearchLogHelper.
+     */
+    @PostConstruct
+    public void init() {
+        if (logger.isDebugEnabled()) {
+            logger.debug("Initializing {}", this.getClass().getSimpleName());
+        }
+        userInfoCache = CacheBuilder.newBuilder()//
+                .maximumSize(userInfoCacheSize)//
+                .expireAfterWrite(userCheckInterval, TimeUnit.MILLISECONDS)//
+                .build(new CacheLoader<String, UserInfo>() {
+                    @Override
+                    public UserInfo load(final String key) throws Exception {
+                        return storeUserInfo(key);
+                    }
+                });
+        searchLogLogger = LogManager.getLogger(loggerName);
+    }
+
+    /** Holds resolved dependencies for search log creation, decoupled from ComponentUtil. */
+    protected static class SearchLogContext {
+        final FessConfig fessConfig;
+        final String[] roles;
+        final String userCode;
+        final String userId;
+        final HttpServletRequest request;
+        final String clientIp;
+        final String virtualHostKey;
+
+        SearchLogContext(final FessConfig fessConfig, final String[] roles, final String userCode, final String userId,
+                final HttpServletRequest request, final String clientIp, final String virtualHostKey) {
+            this.fessConfig = fessConfig;
+            this.roles = roles;
+            this.userCode = userCode;
+            this.userId = userId;
+            this.request = request;
+            this.clientIp = clientIp;
+            this.virtualHostKey = virtualHostKey;
+        }
+    }
+
+    /**
+     * Adds a search log to the queue.
+     *
+     * @param params The search request parameters.
+     * @param requestedTime The time the search was requested.
+     * @param queryId The ID of the search query.
+     * @param query The search query.
+     * @param pageStart The starting page number.
+     * @param pageSize The size of the page.
+     * @param queryResponseList The list of query responses.
+     */
+    public void addSearchLog(final SearchRequestParams params, final LocalDateTime requestedTime, final String queryId, final String query,
+            final int pageStart, final int pageSize, final QueryResponseList queryResponseList) {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        if (searchLogQueue.size() > fessConfig.getLoggingSearchMaxQueueSizeAsInteger()) {
+            logger.warn("[{}] The search log queue size is too large. Skipped the search log: {}", queryId, query);
+            return;
+        }
+
+        final SearchLogContext context = createSearchLogContext(params, fessConfig);
+        createSearchLog(params, requestedTime, queryId, query, pageStart, pageSize, queryResponseList, context);
+    }
+
+    /**
+     * Resolves the runtime dependencies needed to build a SearchLog.
+     *
+     * @param params The search request parameters.
+     * @param fessConfig The Fess configuration.
+     * @return The resolved search log context.
+     */
+    protected SearchLogContext createSearchLogContext(final SearchRequestParams params, final FessConfig fessConfig) {
+        final String[] roles = ComponentUtil.getRoleQueryHelper().build(params.getType()).stream().toArray(n -> new String[n]);
+        final String userCode = fessConfig.isUserInfo() ? ComponentUtil.getUserInfoHelper().getUserCode() : null;
+        final String userId = ComponentUtil.getRequestManager().findUserBean(FessUserBean.class).map(FessUserBean::getUserId).orElse(null);
+        final HttpServletRequest request = LaRequestUtil.getOptionalRequest().orElse(null);
+        final String clientIp = request != null ? ComponentUtil.getViewHelper().getClientIp(request) : null;
+        final String virtualHostKey = ComponentUtil.getVirtualHostHelper().getVirtualHostKey();
+
+        return new SearchLogContext(fessConfig, roles, userCode, userId, request, clientIp, virtualHostKey);
+    }
+
+    /**
+     * Returns the related queries that QueryStringBuilder ORs into the given query, in the form
+     * the query commands record them as field logs. Those words were never typed by the user, so
+     * they must not reach the search log's field logs (and from there the suggest index).
+     * The user's own query is excluded so that it is still logged when it is also a related query.
+     *
+     * @param query The user's search query.
+     * @return The related query values to skip on the default field.
+     */
+    protected Set<String> getRelatedQueryLogValues(final String query) {
+        if (StringUtil.isBlank(query) || !ComponentUtil.hasRelatedQueryHelper()) {
+            return Collections.emptySet();
+        }
+        final String[] relatedQueries = ComponentUtil.getRelatedQueryHelper().getRelatedQueries(query);
+        if (relatedQueries.length == 0) {
+            return Collections.emptySet();
+        }
+        // QueryStringBuilder#quote replaces '"' with a space and the whitespace analyzer splits on
+        // whitespace, so a phrase is logged with its terms joined by single spaces.
+        final String userQuery = StringUtils.normalizeSpace(query.replace('"', ' '));
+        return Arrays.stream(relatedQueries)
+                .map(s -> StringUtils.normalizeSpace(s.replace('"', ' ')))
+                .filter(s -> StringUtil.isNotBlank(s) && !s.equals(userQuery))
+                .collect(Collectors.toSet());
+    }
+
+    /**
+     * Builds a SearchLog from the given parameters and context, then adds it to the queue.
+     *
+     * @param params The search request parameters.
+     * @param requestedTime The time the search was requested.
+     * @param queryId The ID of the search query.
+     * @param query The search query string.
+     * @param pageStart The start position of the page.
+     * @param pageSize The size of the page.
+     * @param queryResponseList The list of query responses.
+     * @param context The search log context holding resolved dependencies.
+     */
+    protected void createSearchLog(final SearchRequestParams params, final LocalDateTime requestedTime, final String queryId,
+            final String query, final int pageStart, final int pageSize, final QueryResponseList queryResponseList,
+            final SearchLogContext context) {
+        final SearchLog searchLog = new SearchLog();
+
+        if (context.userCode != null) {
+            searchLog.setUserSessionId(context.userCode);
+            searchLog.setUserInfo(getUserInfo(context.userCode));
+        }
+
+        searchLog.setRoles(context.roles);
+        searchLog.setQueryId(queryId);
+        searchLog.setHitCount(queryResponseList.getAllRecordCount());
+        searchLog.setHitCountRelation(queryResponseList.getAllRecordCountRelation());
+        searchLog.setResponseTime(queryResponseList.getExecTime());
+        searchLog.setQueryTime(queryResponseList.getQueryTime());
+        searchLog.setSearchWord(StringUtils.abbreviate(query, 1000));
+        searchLog.setRequestedAt(requestedTime);
+        searchLog.setSearchQuery(StringUtils.abbreviate(queryResponseList.getSearchQuery(), 1000));
+        searchLog.setQueryOffset(pageStart);
+        searchLog.setQueryPageSize(pageSize);
+
+        if (context.userId != null) {
+            searchLog.setUser(context.userId);
+        }
+
+        if (context.request != null) {
+            searchLog.setClientIp(StringUtils.abbreviate(context.clientIp, 100));
+            searchLog.setReferer(StringUtils.abbreviate(context.request.getHeader("referer"), 1000));
+            searchLog.setUserAgent(StringUtils.abbreviate(context.request.getHeader("user-agent"), 255));
+
+            final String accessType = determineAccessType(context.request.getAttribute(Constants.SEARCH_LOG_ACCESS_TYPE));
+            searchLog.setAccessType(accessType);
+
+            // Only JSON API searches are read back as search history, so no other access type records the conditions.
+            if (context.userId != null && Constants.SEARCH_LOG_ACCESS_TYPE_JSON.equals(accessType)
+                    && context.fessConfig.isSearchHistoryEnabled()) {
+                searchLog.setSearchParams(buildSearchParams(params));
+            }
+
+            final Object languages = context.request.getAttribute(Constants.REQUEST_LANGUAGES);
+            if (languages != null) {
+                searchLog.setLanguages(StringUtils.join((String[]) languages, ","));
+            } else {
+                searchLog.setLanguages(StringUtil.EMPTY);
+            }
+
+            @SuppressWarnings("unchecked")
+            final Map<String, List<String>> fieldLogMap = (Map<String, List<String>>) context.request.getAttribute(Constants.FIELD_LOGS);
+            if (fieldLogMap != null) {
+                final int queryMaxLength = context.fessConfig.getQueryMaxLengthAsInteger();
+                final Set<String> relatedQueryValues = getRelatedQueryLogValues(params.getQuery());
+                for (final Map.Entry<String, List<String>> logEntry : fieldLogMap.entrySet()) {
+                    final boolean isDefaultField = Constants.DEFAULT_FIELD.equals(logEntry.getKey());
+                    for (final String value : logEntry.getValue()) {
+                        if (isDefaultField && relatedQueryValues.contains(value)) {
+                            continue;
+                        }
+                        searchLog.addSearchFieldLogValue(logEntry.getKey(), StringUtils.abbreviate(value, queryMaxLength));
+                    }
+                }
+            }
+
+            for (final String s : context.fessConfig.getSearchlogRequestHeadersAsArray()) {
+                final String key = s.replace('-', '_').toLowerCase(Locale.ENGLISH);
+                Collections.list(context.request.getHeaders(s)).stream().forEach(v -> {
+                    searchLog.addRequestHeaderValue(key, v);
+                });
+            }
+        }
+
+        if (StringUtil.isNotBlank(context.virtualHostKey)) {
+            searchLog.setVirtualHost(context.virtualHostKey);
+        } else {
+            searchLog.setVirtualHost(StringUtil.EMPTY);
+        }
+
+        addDocumentsInResponse(queryResponseList, searchLog);
+        searchLogQueue.add(searchLog);
+    }
+
+    /**
+     * Builds the compact JSON string that records the search conditions of a request, so that the
+     * search can be re-run later. Only the query, the field conditions, the extra queries, the sort
+     * and the languages explicitly requested by the client are recorded; blank values are omitted.
+     *
+     * @param params The search request parameters.
+     * @return The JSON string, or null if there is nothing to record.
+     */
+    protected String buildSearchParams(final SearchRequestParams params) {
+        final Map<String, Object> conditions = new LinkedHashMap<>();
+        if (StringUtil.isNotBlank(params.getQuery())) {
+            conditions.put("q", params.getQuery());
+        }
+        final Map<String, String[]> requestFields = params.getFields();
+        if (requestFields != null) {
+            final Map<String, List<String>> fields = new LinkedHashMap<>();
+            requestFields.forEach((name, values) -> {
+                final List<String> list = toNonBlankList(values);
+                if (StringUtil.isNotBlank(name) && !list.isEmpty()) {
+                    fields.put(name, list);
+                }
+            });
+            if (!fields.isEmpty()) {
+                conditions.put("fields", fields);
+            }
+        }
+        final List<String> extraQueries = toNonBlankList(params.getExtraQueries());
+        if (!extraQueries.isEmpty()) {
+            conditions.put("ex_q", extraQueries);
+        }
+        if (StringUtil.isNotBlank(params.getSort())) {
+            conditions.put("sort", params.getSort());
+        }
+        // getLanguages() of the JSON API returns only the values of the lang request parameter;
+        // the browser locale is resolved later by SearchHelper#getLanguages and is not recorded.
+        final List<String> languages = toNonBlankList(params.getLanguages());
+        if (!languages.isEmpty()) {
+            conditions.put("lang", languages);
+        }
+        if (conditions.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(conditions);
+        } catch (final JacksonException e) {
+            logger.warn("Failed to build the search conditions: query={}", params.getQuery(), e);
+            return null;
+        }
+    }
+
+    private List<String> toNonBlankList(final String[] values) {
+        if (values == null) {
+            return Collections.emptyList();
+        }
+        return Arrays.stream(values).filter(StringUtil::isNotBlank).collect(Collectors.toList());
+    }
+
+    /**
+     * Returns the access type string from the given request attribute value, defaulting to web.
+     *
+     * @param accessType The access type attribute value from the request.
+     * @return The access type string.
+     */
+    protected String determineAccessType(final Object accessType) {
+        if (Constants.SEARCH_LOG_ACCESS_TYPE_JSON.equals(accessType)) {
+            return Constants.SEARCH_LOG_ACCESS_TYPE_JSON;
+        }
+        if (Constants.SEARCH_LOG_ACCESS_TYPE_GSA.equals(accessType)) {
+            return Constants.SEARCH_LOG_ACCESS_TYPE_GSA;
+        } else if (Constants.SEARCH_LOG_ACCESS_TYPE_OTHER.equals(accessType)) {
+            return Constants.SEARCH_LOG_ACCESS_TYPE_OTHER;
+        } else if (Constants.SEARCH_LOG_ACCESS_TYPE_ADMIN.equals(accessType)) {
+            return Constants.SEARCH_LOG_ACCESS_TYPE_ADMIN;
+        } else if (accessType instanceof String && StringUtil.isNotBlank((String) accessType)) {
+            return (String) accessType;
+        }
+        return Constants.SEARCH_LOG_ACCESS_TYPE_WEB;
+    }
+
+    /**
+     * Adds documents in the response to the search log.
+     *
+     * @param queryResponseList The list of query responses.
+     * @param searchLog The search log.
+     */
+    protected void addDocumentsInResponse(final QueryResponseList queryResponseList, final SearchLog searchLog) {
+        if (ComponentUtil.getFessConfig().isLoggingSearchDocsEnabled()) {
+            queryResponseList.stream().forEach(res -> {
+                final Map<String, Object> map = new HashMap<>();
+                Arrays.stream(ComponentUtil.getFessConfig().getLoggingSearchDocsFieldsAsArray()).forEach(s -> map.put(s, res.get(s)));
+                searchLog.addDocument(map);
+            });
+        }
+    }
+
+    /**
+     * Adds a click log to the queue.
+     *
+     * @param clickLog The click log.
+     */
+    public void addClickLog(final ClickLog clickLog) {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        if (clickLogQueue.size() > fessConfig.getLoggingClickMaxQueueSizeAsInteger()) {
+            logger.warn("Click log queue size exceeded: queueSize={}, limit={}. Skipped.", clickLogQueue.size(),
+                    fessConfig.getLoggingClickMaxQueueSizeAsInteger());
+            return;
+        }
+        clickLogQueue.add(clickLog);
+    }
+
+    /**
+     * Adds a chat log to the queue. The user, the session ID, the roles and the virtual host are
+     * resolved here, so this method must be called on the request thread.
+     *
+     * @param chatLog The chat log with the chat metrics set.
+     */
+    public void addChatLog(final ChatLog chatLog) {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        if (chatLogQueue.size() > fessConfig.getLoggingChatMaxQueueSizeAsInteger()) {
+            logger.warn("Chat log queue size exceeded: queueSize={}, limit={}. Skipped.", chatLogQueue.size(),
+                    fessConfig.getLoggingChatMaxQueueSizeAsInteger());
+            return;
+        }
+        createChatLog(chatLog, createChatLogContext(fessConfig));
+    }
+
+    /**
+     * Resolves the runtime dependencies needed to complete a ChatLog. Chat searches run as JSON
+     * API searches, so the roles are those of a JSON search.
+     *
+     * @param fessConfig The Fess configuration.
+     * @return The resolved context.
+     */
+    protected SearchLogContext createChatLogContext(final FessConfig fessConfig) {
+        final String[] roles = ComponentUtil.getRoleQueryHelper().build(SearchRequestType.JSON).stream().toArray(n -> new String[n]);
+        final String userCode = fessConfig.isUserInfo() ? ComponentUtil.getUserInfoHelper().getUserCode() : null;
+        final String userId = ComponentUtil.getRequestManager().findUserBean(FessUserBean.class).map(FessUserBean::getUserId).orElse(null);
+        final String virtualHostKey = ComponentUtil.getVirtualHostHelper().getVirtualHostKey();
+        return new SearchLogContext(fessConfig, roles, userCode, userId, null, null, virtualHostKey);
+    }
+
+    /**
+     * Completes a ChatLog with the user, the session ID, the roles and the virtual host, then adds it to the queue.
+     * No client IP address and no request header is recorded.
+     *
+     * @param chatLog The chat log.
+     * @param context The context holding the resolved dependencies.
+     */
+    protected void createChatLog(final ChatLog chatLog, final SearchLogContext context) {
+        if (context.userCode != null) {
+            chatLog.setUserSessionId(context.userCode);
+        }
+        if (context.userId != null) {
+            chatLog.setUser(context.userId);
+        }
+        chatLog.setRoles(context.roles);
+        chatLog.setVirtualHost(StringUtil.isNotBlank(context.virtualHostKey) ? context.virtualHostKey : StringUtil.EMPTY);
+        chatLogQueue.add(chatLog);
+    }
+
+    /**
+     * Stores search logs from the queue.
+     */
+    public void storeSearchLog() {
+        storeSearchLogFromQueue();
+        storeClickLogFromQueue();
+        storeChatLogFromQueue();
+    }
+
+    /**
+     * Stores chat logs from the queue.
+     */
+    protected void storeChatLogFromQueue() {
+        if (!chatLogQueue.isEmpty()) {
+            processChatLogQueue(chatLogQueue);
+        }
+    }
+
+    /**
+     * Stores click logs from the queue.
+     */
+    protected void storeClickLogFromQueue() {
+        if (!clickLogQueue.isEmpty()) {
+            processClickLogQueue(clickLogQueue);
+        }
+    }
+
+    /**
+     * Stores search logs from the queue.
+     */
+    protected void storeSearchLogFromQueue() {
+        if (!searchLogQueue.isEmpty()) {
+            processSearchLogQueue(searchLogQueue);
+        }
+    }
+
+    /**
+    * Gets the click count for a URL.
+    *
+    * @param url The URL.
+    * @return The click count.
+    */
+    public int getClickCount(final String url) {
+        final ClickLogBhv clickLogBhv = ComponentUtil.getComponent(ClickLogBhv.class);
+        return clickLogBhv.selectCount(cb -> {
+            cb.query().setUrl_Equal(url);
+        });
+    }
+
+    /**
+     * Gets the favorite count for a URL.
+     *
+     * @param url The URL.
+     * @return The favorite count.
+     */
+    public long getFavoriteCount(final String url) {
+        final FavoriteLogBhv favoriteLogBhv = ComponentUtil.getComponent(FavoriteLogBhv.class);
+        return favoriteLogBhv.selectCount(cb -> {
+            cb.query().setUrl_Equal(url);
+        });
+    }
+
+    /**
+     * Stores user information.
+     *
+     * @param userCode The user code.
+     * @return The user information.
+     */
+    protected UserInfo storeUserInfo(final String userCode) {
+        final UserInfoBhv userInfoBhv = ComponentUtil.getComponent(UserInfoBhv.class);
+
+        final LocalDateTime now = ComponentUtil.getSystemHelper().getCurrentTimeAsLocalDateTime();
+        final UserInfo userInfo = userInfoBhv.selectByPK(userCode).map(e -> {
+            e.setUpdatedAt(now);
+            return e;
+        }).orElseGet(() -> {
+            final UserInfo e = new UserInfo();
+            e.setId(userCode);
+            e.setCreatedAt(now);
+            e.setUpdatedAt(now);
+            return e;
+        });
+        CommonPoolUtil.execute(() -> userInfoBhv.insertOrUpdate(userInfo));
+        return userInfo;
+    }
+
+    /**
+     * Gets user information.
+     *
+     * @param userCode The user code.
+     * @return The user information, or empty if the user code is blank or the user information cannot be loaded.
+     */
+    public OptionalEntity<UserInfo> getUserInfo(final String userCode) {
+        if (StringUtil.isNotBlank(userCode)) {
+            try {
+                return OptionalEntity.of(userInfoCache.get(userCode));
+            } catch (final ExecutionException | UncheckedExecutionException e) {
+                logger.warn("Failed to load the user info; continuing without it.", e.getCause());
+            }
+        }
+        return OptionalEntity.empty();
+    }
+
+    /**
+     * Processes the search log queue.
+     *
+     * @param queue The search log queue.
+     */
+    protected void processSearchLogQueue(final Queue<SearchLog> queue) {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        final String value = fessConfig.getPurgeByBots();
+        String[] botNames;
+        if (StringUtil.isBlank(value)) {
+            botNames = StringUtil.EMPTY_STRINGS;
+        } else {
+            botNames = value.split(",");
+        }
+
+        final int batchSize = fessConfig.getSearchlogProcessBatchSizeAsInteger();
+
+        final List<SearchLog> searchLogList = new ArrayList<>();
+        final Map<String, UserInfo> userInfoMap = new HashMap<>();
+        while (!queue.isEmpty()) {
+            final SearchLog searchLog = queue.poll();
+            if (searchLog != null) {
+                final String userAgent = searchLog.getUserAgent();
+                final boolean isBot =
+                        userAgent != null && stream(botNames).get(stream -> stream.anyMatch(botName -> userAgent.indexOf(botName) >= 0));
+                if (!isBot) {
+                    searchLog.getUserInfo().ifPresent(userInfo -> {
+                        final String code = userInfo.getId();
+                        final UserInfo oldUserInfo = userInfoMap.get(code);
+                        if (oldUserInfo != null) {
+                            userInfo.setCreatedAt(oldUserInfo.getCreatedAt());
+                        }
+                        userInfoMap.put(code, userInfo);
+                    });
+                    searchLogList.add(searchLog);
+                }
+            }
+            if (searchLogList.size() >= batchSize) {
+                processUserInfoLog(searchLogList, userInfoMap);
+                processSearchLog(searchLogList);
+                searchLogList.clear();
+                userInfoMap.clear();
+            }
+        }
+
+        if (!searchLogList.isEmpty()) {
+            processUserInfoLog(searchLogList, userInfoMap);
+            processSearchLog(searchLogList);
+        }
+    }
+
+    /**
+     * Processes the search log list.
+     *
+     * @param searchLogList The search log list.
+     */
+    protected void processSearchLog(final List<SearchLog> searchLogList) {
+        if (!searchLogList.isEmpty()) {
+            final FessConfig fessConfig = ComponentUtil.getFessConfig();
+            // write log
+            if (fessConfig.isLoggingSearchUseLogfile()) {
+                searchLogList.forEach(this::writeSearchLogEvent);
+            }
+            // insert search log
+            storeSearchLogList(searchLogList);
+            // update suggest index
+            if (fessConfig.isSuggestSearchLog()) {
+                final SuggestHelper suggestHelper = ComponentUtil.getSuggestHelper();
+                suggestHelper.indexFromSearchLog(searchLogList);
+            }
+        }
+    }
+
+    /**
+     * Processes user information logs.
+     *
+     * @param searchLogList The search log list.
+     * @param userInfoMap The user information map.
+     */
+    protected void processUserInfoLog(final List<SearchLog> searchLogList, final Map<String, UserInfo> userInfoMap) {
+        if (!userInfoMap.isEmpty()) {
+            final FessConfig fessConfig = ComponentUtil.getFessConfig();
+            final List<UserInfo> insertList = new ArrayList<>(userInfoMap.values());
+            final List<UserInfo> updateList = new ArrayList<>();
+            final UserInfoBhv userInfoBhv = ComponentUtil.getComponent(UserInfoBhv.class);
+            userInfoBhv.selectList(cb -> {
+                cb.query().setId_InScope(userInfoMap.keySet());
+                cb.fetchFirst(userInfoMap.size());
+            }).forEach(userInfo -> {
+                final String code = userInfo.getId();
+                final UserInfo entity = userInfoMap.get(code);
+                entity.setId(userInfo.getId());
+                entity.setCreatedAt(userInfo.getCreatedAt());
+                updateList.add(entity);
+                insertList.remove(entity);
+            });
+            // write log
+            if (fessConfig.isLoggingSearchUseLogfile()) {
+                insertList.forEach(this::writeSearchLogEvent);
+                updateList.forEach(this::writeSearchLogEvent);
+            }
+            // insert/update user info
+            userInfoBhv.batchInsert(insertList);
+            userInfoBhv.batchUpdate(updateList);
+            // update search log
+            searchLogList.stream().forEach(searchLog -> {
+                searchLog.getUserInfo().ifPresent(userInfo -> {
+                    searchLog.setUserInfoId(userInfo.getId());
+                });
+            });
+        }
+    }
+
+    /**
+    * Stores a list of search logs.
+    *
+    * @param searchLogList The search log list.
+    */
+    protected void storeSearchLogList(final List<SearchLog> searchLogList) {
+        final SearchLogBhv searchLogBhv = ComponentUtil.getComponent(SearchLogBhv.class);
+        searchLogBhv.batchUpdate(searchLogList, op -> {
+            op.setRefreshPolicy(Constants.TRUE);
+        });
+    }
+
+    /**
+     * Processes the click log queue.
+     *
+     * @param queue The click log queue.
+     */
+    protected void processClickLogQueue(final Queue<ClickLog> queue) {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        final int batchSize = fessConfig.getSearchlogProcessBatchSizeAsInteger();
+        final Map<String, Integer> clickCountMap = new HashMap<>();
+        final List<ClickLog> clickLogList = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            final ClickLog clickLog = queue.poll();
+            if (clickLog != null && StringUtil.isBlank(clickLog.getQueryId())) {
+                // The v2 click API accepts a click without a query ID, but without it the originating
+                // search log cannot be found, so there is nothing to enrich the click with.
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Skipped a click log without a query ID: {}", clickLog);
+                }
+            } else if (clickLog != null) {
+                try {
+                    final SearchLogBhv searchLogBhv = ComponentUtil.getComponent(SearchLogBhv.class);
+                    final OptionalEntity<SearchLog> searchLog = searchLogBhv.selectEntity(cb -> {
+                        cb.query().setQueryId_Equal(clickLog.getQueryId());
+                    });
+                    if (acceptClickLog(clickLog, searchLog)) {
+                        clickLogList.add(clickLog);
+                        final String docId = clickLog.getDocId();
+                        Integer countObj = clickCountMap.get(docId);
+                        if (countObj == null) {
+                            countObj = 1;
+                        } else {
+                            countObj = countObj.intValue() + 1;
+                        }
+                        clickCountMap.put(docId, countObj);
+                    }
+                } catch (final Exception e) {
+                    logger.warn("Failed to process: {}", clickLog, e);
+                }
+            }
+            if (clickLogList.size() >= batchSize) {
+                processClickLog(clickLogList);
+                updateClickFieldInIndex(clickCountMap);
+                clickLogList.clear();
+                clickCountMap.clear();
+            }
+        }
+
+        if (!clickLogList.isEmpty()) {
+            processClickLog(clickLogList);
+            updateClickFieldInIndex(clickCountMap);
+        }
+    }
+
+    /**
+     * Enriches a click log with the originating search log, or warns when that search log is missing.
+     *
+     * @param clickLog the click log
+     * @param searchLog the search log with the same query ID
+     * @return true if the search log exists and the click log should be stored
+     */
+    protected boolean acceptClickLog(final ClickLog clickLog, final OptionalEntity<SearchLog> searchLog) {
+        if (searchLog.isPresent()) {
+            enrichClickLog(clickLog, searchLog.get());
+            return true;
+        }
+        logger.warn("Not Found for SearchLog: {}", clickLog);
+        return false;
+    }
+
+    /**
+     * Copies the originating search's context onto a click log and normalizes its position.
+     * The rank is left unset when it is not within 1 to {@link #MAX_CLICK_RANK}.
+     *
+     * @param clickLog the click log to enrich
+     * @param searchLog the search log with the same query ID
+     */
+    protected void enrichClickLog(final ClickLog clickLog, final SearchLog searchLog) {
+        clickLog.setSearchWord(searchLog.getSearchWord());
+        clickLog.setAccessType(searchLog.getAccessType());
+        final Integer order = clickLog.getOrder();
+        if (order == null || order < 0) {
+            return;
+        }
+        final long rank;
+        if (clickLog.isOrderOnPage()) {
+            final Integer offset = searchLog.getQueryOffset();
+            rank = (offset != null && offset > 0 ? offset : 0L) + order + 1L;
+        } else {
+            rank = order;
+        }
+        if (rank >= 1 && rank <= MAX_CLICK_RANK) {
+            clickLog.setRank((int) rank);
+        }
+    }
+
+    /**
+     * Updates the click field in the index.
+     *
+     * @param clickCountMap The click count map.
+     */
+    protected void updateClickFieldInIndex(final Map<String, Integer> clickCountMap) {
+        if (!clickCountMap.isEmpty()) {
+            final SearchHelper searchHelper = ComponentUtil.getSearchHelper();
+            final FessConfig fessConfig = ComponentUtil.getFessConfig();
+            try {
+                final UpdateRequest[] updateRequests =
+                        searchHelper
+                                .getDocumentListByDocIds(clickCountMap.keySet().toArray(new String[clickCountMap.size()]),
+                                        new String[] { fessConfig.getIndexFieldDocId(), fessConfig.getIndexFieldLang() },
+                                        OptionalThing.of(FessUserBean.empty()), SearchRequestType.ADMIN_SEARCH)
+                                .stream()
+                                .map(doc -> {
+                                    final String id = DocumentUtil.getValue(doc, fessConfig.getIndexFieldId(), String.class);
+                                    final String docId = DocumentUtil.getValue(doc, fessConfig.getIndexFieldDocId(), String.class);
+                                    if (id != null && docId != null && clickCountMap.containsKey(docId)) {
+                                        final Integer count = clickCountMap.get(docId);
+                                        final Script script = ComponentUtil.getLanguageHelper()
+                                                .createScript(doc,
+                                                        "ctx._source." + fessConfig.getIndexFieldClickCount() + "+=" + count.toString());
+                                        final Map<String, Object> upsertMap = new HashMap<>();
+                                        upsertMap.put(fessConfig.getIndexFieldClickCount(), count);
+                                        return new UpdateRequest(fessConfig.getIndexDocumentUpdateIndex(), id).script(script)
+                                                .upsert(upsertMap);
+                                    }
+                                    return null;
+                                })
+                                .filter(req -> req != null)
+                                .toArray(n -> new UpdateRequest[n]);
+                if (updateRequests.length > 0) {
+                    searchHelper.bulkUpdate(builder -> {
+                        for (final UpdateRequest req : updateRequests) {
+                            builder.add(req);
+                        }
+                    });
+                }
+            } catch (final Exception e) {
+                logger.warn("Failed to update clickCounts", e);
+            }
+        }
+    }
+
+    /**
+     * Processes a list of click logs.
+     *
+     * @param clickLogList The click log list.
+     */
+    protected void processClickLog(final List<ClickLog> clickLogList) {
+        if (!clickLogList.isEmpty()) {
+            final FessConfig fessConfig = ComponentUtil.getFessConfig();
+            if (fessConfig.isLoggingSearchUseLogfile()) {
+                clickLogList.forEach(this::writeSearchLogEvent);
+            }
+            try {
+                ComponentUtil.getComponent(ClickLogBhv.class).batchInsert(clickLogList);
+            } catch (final Exception e) {
+                logger.warn("Failed to insert: {}", clickLogList, e);
+            }
+        }
+    }
+
+    /**
+     * Processes the chat log queue in batches of {@code searchlog.process.batch_size}.
+     *
+     * @param queue The chat log queue.
+     */
+    protected void processChatLogQueue(final Queue<ChatLog> queue) {
+        final int batchSize = ComponentUtil.getFessConfig().getSearchlogProcessBatchSizeAsInteger();
+        final List<ChatLog> chatLogList = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            final ChatLog chatLog = queue.poll();
+            if (chatLog != null) {
+                chatLogList.add(chatLog);
+            }
+            if (chatLogList.size() >= batchSize) {
+                processChatLog(chatLogList);
+                chatLogList.clear();
+            }
+        }
+        if (!chatLogList.isEmpty()) {
+            processChatLog(chatLogList);
+        }
+    }
+
+    /**
+     * Writes a list of chat logs to the log file, if enabled, and stores them in the chat log index.
+     *
+     * @param chatLogList The chat log list.
+     */
+    protected void processChatLog(final List<ChatLog> chatLogList) {
+        if (chatLogList.isEmpty()) {
+            return;
+        }
+        if (ComponentUtil.getFessConfig().isLoggingSearchUseLogfile()) {
+            chatLogList.forEach(this::writeSearchLogEvent);
+        }
+        try {
+            storeChatLogList(chatLogList);
+        } catch (final Exception e) {
+            logger.warn("Failed to store chat logs: size={}", chatLogList.size(), e);
+        }
+    }
+
+    /**
+     * Stores a list of chat logs.
+     *
+     * @param chatLogList The chat log list.
+     */
+    protected void storeChatLogList(final List<ChatLog> chatLogList) {
+        final ChatLogBhv chatLogBhv = ComponentUtil.getComponent(ChatLogBhv.class);
+        chatLogBhv.batchInsert(chatLogList, op -> {
+            op.setRefreshPolicy(Constants.TRUE);
+        });
+    }
+
+    /**
+     * Writes a search log event.
+     *
+     * @param event The search log event.
+     */
+    public void writeSearchLogEvent(final SearchLogEvent event) {
+        try {
+            final Map<String, Object> source = toSource(event);
+            searchLogLogger.info(objectMapper.writeValueAsString(source));
+        } catch (final JacksonException e) {
+            logger.warn("Failed to write {}", event, e);
+        }
+    }
+
+    /**
+    * Converts a search log event to a source map.
+    *
+    * @param searchLogEvent The search log event.
+    * @return The source map.
+    */
+    protected Map<String, Object> toSource(final SearchLogEvent searchLogEvent) {
+        final Map<String, Object> source = toLowerHyphen(searchLogEvent.toSource());
+        source.put("_id", searchLogEvent.getId());
+        // source.put("version_no", searchLogEvent.getVersionNo());
+        source.put("event_type", searchLogEvent.getEventType());
+        return source;
+    }
+
+    /**
+     * Converts a map to lower hyphen case.
+     *
+     * @param source The source map.
+     * @return The converted map.
+     */
+    protected Map<String, Object> toLowerHyphen(final Map<String, Object> source) {
+        return source.entrySet()
+                .stream()
+                .collect(Collectors.toMap(e -> CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_UNDERSCORE, e.getKey()), e -> {
+                    final Object value = e.getValue();
+                    if (value instanceof Map) {
+                        @SuppressWarnings("unchecked")
+                        final Map<String, Object> mapValue = (Map<String, Object>) value;
+                        return toLowerHyphen(mapValue);
+                    }
+                    return e.getValue();
+                }));
+    }
+
+    /**
+     * Sets the user check interval.
+     *
+     * @param userCheckInterval The user check interval.
+     */
+    public void setUserCheckInterval(final long userCheckInterval) {
+        this.userCheckInterval = userCheckInterval;
+    }
+
+    /**
+     * Sets the user information cache size.
+     *
+     * @param userInfoCacheSize The user information cache size.
+     */
+    public void setUserInfoCacheSize(final int userInfoCacheSize) {
+        this.userInfoCacheSize = userInfoCacheSize;
+    }
+
+    /**
+     * Sets the logger name.
+     *
+     * @param loggerName The logger name.
+     */
+    public void setLoggerName(final String loggerName) {
+        this.loggerName = loggerName;
+    }
+}

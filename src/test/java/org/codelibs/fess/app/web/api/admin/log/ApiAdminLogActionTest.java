@@ -1,0 +1,233 @@
+/*
+ * Copyright 2012-2025 CodeLibs Project and the Others.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+package org.codelibs.fess.app.web.api.admin.log;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
+
+import org.codelibs.core.io.CopyUtil;
+import org.codelibs.fess.app.service.AccessTokenService;
+import org.codelibs.fess.app.web.base.login.FessLoginAssist;
+import org.codelibs.fess.helper.SystemHelper;
+import org.codelibs.fess.unit.UnitFessTestCase;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
+import org.lastaflute.web.response.StreamResponse;
+import org.lastaflute.web.servlet.request.stream.WrittenStreamOut;
+import org.lastaflute.web.validation.exception.ValidationErrorException;
+
+/**
+ * Tests for the log file download of {@link ApiAdminLogAction}: a log file in the log directory is
+ * served, and no id reaches a file outside of it.
+ */
+public class ApiAdminLogActionTest extends UnitFessTestCase {
+
+    private static final String OUTSIDE = "outside the log directory";
+
+    private Path logDir;
+
+    @Override
+    protected void setUp(final TestInfo testInfo) throws Exception {
+        super.setUp(testInfo);
+        // <root>/etc/hosts.log is outside of the log directory <root>/a/b, two levels above it.
+        final Path root = Files.createTempDirectory("fess_api_log");
+        logDir = Files.createDirectories(root.resolve("a").resolve("b"));
+        Files.createDirectories(root.resolve("etc"));
+        Files.write(root.resolve("etc").resolve("hosts.log"), OUTSIDE.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    public void test_get$file_servesLogFilesOfTheLogDirectory() throws Exception {
+        Files.write(logDir.resolve("fess.log"), "log line".getBytes(StandardCharsets.UTF_8));
+        Files.write(logDir.resolve("fess.log.gz"), "gz bytes".getBytes(StandardCharsets.UTF_8));
+
+        final StreamResponse log = action().get$file(id("fess.log"));
+        assertEquals("fess.log", log.getFileName());
+        assertEquals("log line", drain(log));
+        assertEquals("gz bytes", drain(action().get$file(id("fess.log.gz"))));
+    }
+
+    /** Whitespace between the dots must not turn into ".." after the ".." removal. */
+    @Test
+    public void test_get$file_whitespaceBetweenDotsDoesNotEscapeTheLogDirectory() throws Exception {
+        assertFalse(served(". ./. ./etc/hosts.log").contains(OUTSIDE), "a file outside of the log directory was served");
+    }
+
+    @Test
+    public void test_get$file_noTraversalSpellingReachesAFileOutsideTheLogDirectory() throws Exception {
+        final String[] ids = { "../../etc/hosts.log", ". ./. ./etc/hosts.log", ".\t./.\t./etc/hosts.log", ".\n./.\n./etc/hosts.log",
+                "..\\..\\etc\\hosts.log", ". .\\. .\\etc\\hosts.log", "....//....//etc/hosts.log", "/../../etc/hosts.log" };
+        for (final String id : ids) {
+            assertFalse(served(id).contains(OUTSIDE), "a file outside of the log directory was served for: " + id);
+        }
+    }
+
+    @Test
+    public void test_get$file_absoluteLookingNameStaysInTheLogDirectory() throws Exception {
+        final Path other = Files.createDirectories(logDir.resolve("etc"));
+        Files.write(other.resolve("hosts.log"), "inside".getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("inside", drain(action().get$file(id("/etc/hosts.log"))));
+    }
+
+    /** The ids of these names contain the URL-safe characters "_" and "-" that the list hands out. */
+    @Test
+    public void test_get$file_servesLogFilesWhoseIdContainsUrlSafeCharacters() throws Exception {
+        final String underscore = "ab?.log";
+        final String hyphen = "fess~~.log";
+        assertTrue(id(underscore).contains("_"), id(underscore));
+        assertTrue(id(hyphen).contains("-"), id(hyphen));
+        Files.write(logDir.resolve(underscore), "underscore".getBytes(StandardCharsets.UTF_8));
+        Files.write(logDir.resolve(hyphen), "hyphen".getBytes(StandardCharsets.UTF_8));
+
+        final StreamResponse first = action().get$file(id(underscore));
+        assertEquals(underscore, first.getFileName());
+        assertEquals("underscore", drain(first));
+        final StreamResponse second = action().get$file(id(hyphen));
+        assertEquals(hyphen, second.getFileName());
+        assertEquals("hyphen", drain(second));
+    }
+
+    /** The log list shows these names, so the id it hands out has to download them: the name is looked up as it is. */
+    @Test
+    public void test_get$file_servesLogFilesWhoseNameHoldsWhiteSpaceOrDots() throws Exception {
+        final String[] names = { "r13 sp ace.log", " lead.log", "trail .log", "tab\there.log", "a..b.log", "fess..log.gz", "..hidden.log",
+                "dot . dot.log", "ログ 2026.log.gz" };
+        for (final String name : names) {
+            Files.write(logDir.resolve(name), ("content of " + name).getBytes(StandardCharsets.UTF_8));
+            final StreamResponse log = injectedAction().get$file(id(name));
+            assertEquals(name, log.getFileName());
+            assertEquals("content of " + name, drain(log));
+        }
+    }
+
+    /** Looking the name up as it is must not make the name of one file reach another one. */
+    @Test
+    public void test_get$file_aNameWithWhiteSpaceDoesNotReachTheFileWithoutIt() throws Exception {
+        Files.write(logDir.resolve("fess.log"), "plain".getBytes(StandardCharsets.UTF_8));
+        Files.write(logDir.resolve("ab.log"), "dots".getBytes(StandardCharsets.UTF_8));
+
+        for (final String name : new String[] { "fe ss.log", " fess.log", "fess.log ", "fess\t.log", "a..b.log", "f.. ess.log" }) {
+            assertEquals("served for: " + name, "", served(name));
+        }
+    }
+
+    /** An id spelled with the standard Base64 alphabet is still accepted. */
+    @Test
+    public void test_get$file_acceptsAnIdOfTheStandardAlphabet() throws Exception {
+        final String name = "ab?.log";
+        final String standardId = Base64.getEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8));
+        assertTrue(standardId.contains("/"), standardId);
+        Files.write(logDir.resolve(name), "standard".getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("standard", drain(action().get$file(standardId)));
+    }
+
+    /** A name that is not a log file, or a log file that does not exist, is answered like an id that is not in the list. */
+    @Test
+    public void test_get$file_anUnknownFileIsAValidationError() throws Exception {
+        Files.write(logDir.resolve("fess.txt"), "text".getBytes(StandardCharsets.UTF_8));
+        Files.createDirectories(logDir.resolve("dir.log"));
+        final ApiAdminLogAction action = injectedAction();
+        for (final String name : new String[] { "../../etc/passwd", "fess.txt", "fess.log.bak", "", "..", "missing.log", "missing.log.gz",
+                "dir.log" }) {
+            assertValidationError(() -> action.get$file(id(name))).handle(data -> {
+                data.requiredMessageOf("_global", "errors.could_not_find_log_file");
+            });
+        }
+    }
+
+    /** An id that is not base64 is answered with a validation error (HTTP 400), not with the exception the decoder throws (HTTP 500). */
+    @Test
+    public void test_get$file_anIdThatIsNotBase64IsAValidationError() throws Exception {
+        final ApiAdminLogAction action = injectedAction();
+        for (final String id : new String[] { "a", "not base64!", "@@@@", "ZmVzcy5sb2c=x" }) {
+            assertValidationError(() -> action.get$file(id)).handle(data -> {
+                data.requiredMessageOf("_global", "errors.could_not_find_log_file");
+            });
+        }
+    }
+
+    private ApiAdminLogAction injectedAction() {
+        // FessApiAction declares @Resource AccessTokenService and FessBaseAction FessLoginAssist, whose own
+        // @Resource fields cannot be assembled in the unit container; only the framework fields that
+        // throwValidationErrorApi() needs are used here.
+        suppressBindingOf(AccessTokenService.class);
+        suppressBindingOf(FessLoginAssist.class);
+        final ApiAdminLogAction action = action();
+        inject(action);
+        return action;
+    }
+
+    private ApiAdminLogAction action() {
+        final String path = logDir.toString();
+        return new ApiAdminLogAction() {
+            {
+                systemHelper = new SystemHelper() {
+                    @Override
+                    public String getLogFilePath() {
+                        return path;
+                    }
+                };
+            }
+        };
+    }
+
+    /** The id the log list hands out. */
+    private static String id(final String name) {
+        return Base64.getUrlEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** What the client receives: the streamed text, nothing for a validation error, or the failure that reached it instead. */
+    private String served(final String name) {
+        final StreamResponse response;
+        try {
+            response = injectedAction().get$file(id(name));
+        } catch (final ValidationErrorException e) {
+            return "";
+        }
+        if (response.getStreamCall() == null) {
+            return "";
+        }
+        try {
+            return drain(response);
+        } catch (final Exception e) {
+            return e.getClass().getSimpleName();
+        }
+    }
+
+    private String drain(final StreamResponse response) throws IOException {
+        final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        response.getStreamCall().callback(new WrittenStreamOut() {
+            @Override
+            public OutputStream stream() {
+                return out;
+            }
+
+            @Override
+            public void write(final InputStream ins) throws IOException {
+                CopyUtil.copy(ins, out);
+            }
+        });
+        return new String(out.toByteArray(), StandardCharsets.UTF_8);
+    }
+}

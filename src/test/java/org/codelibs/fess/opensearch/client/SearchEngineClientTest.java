@@ -1,0 +1,987 @@
+/*
+ * Copyright 2012-2025 CodeLibs Project and the Others.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+package org.codelibs.fess.opensearch.client;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.LogEvent;
+import org.codelibs.fesen.client.EngineInfo;
+import org.codelibs.fesen.client.EngineInfo.EngineType;
+import org.codelibs.fess.exception.FessSystemException;
+import org.codelibs.fess.exception.InvalidQueryException;
+import org.codelibs.fess.exception.SearchEngineUnavailableException;
+import org.codelibs.fess.helper.SystemHelper;
+import org.codelibs.fess.mylasta.direction.FessConfig;
+import org.codelibs.fess.unit.LogCapturingAppender;
+import org.codelibs.fess.unit.UnitFessTestCase;
+import org.codelibs.fess.util.BooleanFunction;
+import org.codelibs.fess.util.ComponentUtil;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
+import org.lastaflute.di.exception.ContainerInitFailureException;
+import org.codelibs.fesen.opensearch.OpenSearchException;
+import org.codelibs.fesen.opensearch.OpenSearchStatusException;
+import org.codelibs.fesen.opensearch.core.rest.RestStatus;
+import org.codelibs.fesen.opensearch.transport.client.AdminClient;
+import org.codelibs.fesen.opensearch.action.ActionRequest;
+import org.codelibs.fesen.opensearch.action.ActionType;
+import org.codelibs.fesen.opensearch.action.search.CreatePitAction;
+import org.codelibs.fesen.opensearch.action.search.CreatePitResponse;
+import org.codelibs.fesen.opensearch.action.search.DeletePitRequest;
+import org.codelibs.fesen.opensearch.action.search.DeletePitResponse;
+import org.codelibs.fesen.opensearch.action.search.SearchAction;
+import org.codelibs.fesen.opensearch.action.search.SearchPhaseExecutionException;
+import org.codelibs.fesen.opensearch.action.search.SearchRequestBuilder;
+import org.codelibs.fesen.opensearch.action.search.SearchRequest;
+import org.codelibs.fesen.opensearch.action.search.SearchResponse;
+import org.codelibs.fesen.opensearch.action.search.ShardSearchFailure;
+import org.codelibs.fesen.opensearch.action.support.PlainActionFuture;
+import org.codelibs.fesen.opensearch.common.action.ActionFuture;
+import org.codelibs.fesen.opensearch.core.action.ActionListener;
+import org.codelibs.fesen.opensearch.core.action.ActionResponse;
+import org.codelibs.fesen.opensearch.common.xcontent.json.JsonXContent;
+import org.codelibs.fesen.opensearch.core.xcontent.DeprecationHandler;
+import org.codelibs.fesen.opensearch.core.xcontent.NamedXContentRegistry;
+import org.codelibs.fesen.opensearch.core.xcontent.XContentParser;
+import org.codelibs.fesen.opensearch.index.query.QueryBuilders;
+import org.codelibs.fesen.opensearch.search.sort.FieldSortBuilder;
+import org.codelibs.fesen.opensearch.search.sort.SortBuilder;
+import org.codelibs.fesen.opensearch.search.sort.SortOrder;
+
+public class SearchEngineClientTest extends UnitFessTestCase {
+
+    @Override
+    protected void setUp(TestInfo testInfo) throws Exception {
+        super.setUp(testInfo);
+    }
+
+    @Override
+    protected void tearDown(TestInfo testInfo) throws Exception {
+        super.tearDown(testInfo);
+    }
+
+    // Basic test to verify test framework is working
+    @Test
+    public void test_basicAssertion() {
+        assertTrue(true);
+        assertFalse(false);
+        assertNotNull("test");
+        assertEquals(1, 1);
+    }
+
+    /**
+     * bin/fess.in.sh always sets SEARCH_ENGINE_HTTP_URL, so a new installation with no engine at
+     * all never sees the "no search engine address is configured" message and its fess-setup hint.
+     * What it does see is this one, and it has to name the command that installs an engine too.
+     */
+    @Test
+    public void test_waitForYellowStatus_unavailableEngineNamesFessSetup() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final SearchEngineClient client = new SearchEngineClient() {
+            {
+                this.client = this;
+            }
+
+            @Override
+            public AdminClient admin() {
+                throw new IllegalStateException("Connection refused");
+            }
+        };
+        client.setMaxEsStatusRetry(1);
+        try {
+            client.waitForYellowStatus(new FessConfig.SimpleImpl());
+            fail("an engine that never answers has to fail the startup");
+        } catch (final ContainerInitFailureException e) {
+            final String message = e.getMessage();
+            assertTrue(message, message.contains("did not become available"));
+            assertTrue(message, message.contains("Check that OpenSearch is running and reachable."));
+            assertTrue(message, message.contains("bin/fess-setup install opensearch"));
+        }
+    }
+
+    /** A client whose requests to the engine fail with the given failures in turn; the last one repeats. */
+    private SearchEngineClient clientFailingWith(final RuntimeException... failures) {
+        final AtomicInteger requests = new AtomicInteger();
+        return new SearchEngineClient() {
+            {
+                this.client = this;
+            }
+
+            @Override
+            public AdminClient admin() {
+                throw failures[Math.min(requests.getAndIncrement(), failures.length - 1)];
+            }
+        };
+    }
+
+    private static FessConfig fessConfigOfType(final String type) {
+        return new FessConfig.SimpleImpl() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public String getSearchEngineType() {
+                return type;
+            }
+        };
+    }
+
+    private static final String AWS_ADVICE = "Fess cannot sign requests with IAM credentials, so use fine-grained access control with a"
+            + " user name and password, or an access policy that permits this host.";
+
+    @Test
+    public void test_isAccessDenied() {
+        assertTrue(SearchEngineClient.isAccessDenied(new OpenSearchStatusException("x", RestStatus.UNAUTHORIZED, null)));
+        assertTrue(SearchEngineClient.isAccessDenied(new OpenSearchStatusException("x", RestStatus.FORBIDDEN, null)));
+        assertFalse(SearchEngineClient.isAccessDenied(new OpenSearchStatusException("x", RestStatus.NOT_FOUND, null)));
+        assertFalse(SearchEngineClient.isAccessDenied(new OpenSearchStatusException("x", RestStatus.SERVICE_UNAVAILABLE, null)));
+        // an error body without a known status leaves it unset
+        assertFalse(SearchEngineClient.isAccessDenied(new OpenSearchStatusException("x", null, null)));
+        assertFalse(SearchEngineClient.isAccessDenied(new IllegalStateException("Connection refused")));
+        assertFalse(SearchEngineClient.isAccessDenied(null));
+    }
+
+    @Test
+    public void test_isCapacityRejection() {
+        assertTrue(SearchEngineClient.isCapacityRejection(new OpenSearchStatusException("x", RestStatus.TOO_MANY_REQUESTS, null)));
+        assertTrue(SearchEngineClient.isCapacityRejection(new OpenSearchStatusException("x", RestStatus.SERVICE_UNAVAILABLE, null)));
+        assertFalse(SearchEngineClient.isCapacityRejection(new OpenSearchStatusException("x", RestStatus.BAD_REQUEST, null)));
+        assertFalse(SearchEngineClient.isCapacityRejection(new OpenSearchStatusException("x", RestStatus.INTERNAL_SERVER_ERROR, null)));
+        // an error body without a known status leaves it unset
+        assertFalse(SearchEngineClient.isCapacityRejection(new OpenSearchStatusException("x", null, null)));
+        assertFalse(SearchEngineClient.isCapacityRejection(new OpenSearchException("x")));
+    }
+
+    /**
+     * The search engine answers a search it has no room for with 429 (circuit breaker, full queue)
+     * or 503 (no shard to serve it). That is not a bad query: it used to be thrown as an
+     * InvalidQueryException, which the search repeated with escaped characters and the API
+     * answered as a 400.
+     */
+    @Test
+    public void test_search_capacityRejection_isNotAnInvalidQuery() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final String reason = "OpenSearch exception [type=circuit_breaking_exception, reason=[parent] Data too large, data for"
+                + " [<http_request>] would be [2053027584/1.9gb], larger than the limit of [2040109465/1.8gb]]";
+        for (final RestStatus status : new RestStatus[] { RestStatus.TOO_MANY_REQUESTS, RestStatus.SERVICE_UNAVAILABLE }) {
+            final OpenSearchStatusException rejection = new OpenSearchStatusException(reason, status, null);
+            final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+            try {
+                clientSearchFailingWith(rejection).search("fess.search", builder -> true, (builder, execTime, response) -> response);
+                fail("a capacity rejection must not be answered as a result");
+            } catch (final SearchEngineUnavailableException e) {
+                assertEquals(rejection, e.getCause());
+                // The engine's reason is logged once, at WARN and without a stack trace.
+                final List<LogEvent> warnings = capture.eventsOnThisThreadAt(Level.WARN);
+                assertEquals(1, warnings.size());
+                final String message = warnings.get(0).getMessage().getFormattedMessage();
+                assertTrue(message, message.contains("status=" + status.getStatus()));
+                assertTrue(message, message.contains("circuit_breaking_exception"));
+                assertTrue(message, message.contains("Data too large"));
+                assertNull(warnings.get(0).getThrown(), "a capacity rejection is not worth a stack trace");
+            } finally {
+                capture.detach();
+            }
+        }
+    }
+
+    @Test
+    public void test_isIndexClosed() {
+        assertTrue(SearchEngineClient.isIndexClosed(new OpenSearchStatusException(
+                "OpenSearch exception [type=index_closed_exception, reason=closed]", RestStatus.BAD_REQUEST, null)));
+        assertFalse(SearchEngineClient.isIndexClosed(
+                new OpenSearchStatusException("OpenSearch exception [type=illegal_argument_exception, reason=Result window is too large]",
+                        RestStatus.BAD_REQUEST, null)));
+        assertFalse(SearchEngineClient.isIndexClosed(new OpenSearchStatusException(null, RestStatus.BAD_REQUEST, null)));
+        assertFalse(SearchEngineClient.isIndexClosed(new OpenSearchException("x")));
+    }
+
+    /**
+     * The search engine answers a search of a closed index with a 400, but nothing is wrong with the
+     * query: it must not be thrown as an InvalidQueryException, which the search repeats with an
+     * escaped query and the API answers as an invalid request.
+     */
+    @Test
+    public void test_search_closedIndex_isNotAnInvalidQuery() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final OpenSearchStatusException closed = new OpenSearchStatusException(
+                "OpenSearch exception [type=index_closed_exception, reason=closed]", RestStatus.BAD_REQUEST, null);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            clientSearchFailingWith(closed).search("fess.search", builder -> true, (builder, execTime, response) -> response);
+            fail("a closed index must not be answered as a result");
+        } catch (final SearchEngineUnavailableException e) {
+            assertEquals(closed, e.getCause());
+            final List<LogEvent> warnings = capture.eventsOnThisThreadAt(Level.WARN);
+            assertEquals(1, warnings.size());
+            final String message = warnings.get(0).getMessage().getFormattedMessage();
+            assertTrue(message, message.contains("fess.search"));
+            assertTrue(message, message.contains("index_closed_exception"));
+            assertNull(warnings.get(0).getThrown(), "a closed index is not worth a stack trace");
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_search_otherEngineFailures_stayInvalidQueries() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final OpenSearchException[] failures = { new OpenSearchStatusException("x", RestStatus.BAD_REQUEST, null),
+                new OpenSearchStatusException("x", RestStatus.INTERNAL_SERVER_ERROR, null), new OpenSearchStatusException("x", null, null),
+                new OpenSearchException("x") };
+        for (final OpenSearchException failure : failures) {
+            try {
+                clientSearchFailingWith(failure).search("fess.search", builder -> true, (builder, execTime, response) -> response);
+                fail("an engine failure must not be answered as a result");
+            } catch (final InvalidQueryException e) {
+                assertEquals(failure, e.getCause());
+            }
+        }
+    }
+
+    /**
+     * The query dump carries the permission names of the caller, which an SSO identity provider
+     * releases, so one with a NEL, LS or PS in it must not start a line of the log: JSON leaves
+     * those three raw while it escapes CR and LF.
+     */
+    @Test
+    public void test_search_queryDslLogKeepsLineSeparatorsOfTermsOut() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            for (final RuntimeException failure : new RuntimeException[] {
+                    new SearchPhaseExecutionException("query", "all shards failed", ShardSearchFailure.EMPTY_ARRAY),
+                    new OpenSearchException("x") }) {
+                try {
+                    clientSearchFailingWith(failure).search("fess.search", builder -> {
+                        builder.setQuery(QueryBuilders.termQuery("role", "g\u2028ERROR forged\u2029x\u0085y\r\nz"));
+                        return true;
+                    }, (builder, execTime, response) -> response);
+                    fail("an engine failure must not be answered as a result");
+                } catch (final InvalidQueryException e) {
+                    // expected
+                }
+            }
+            final List<String> messages = capture.messagesAt(Level.DEBUG);
+            for (final String prefix : new String[] { "Query DSL:", "Invalid query", "Cannot process" }) {
+                assertTrue(prefix, messages.stream().anyMatch(m -> m.startsWith(prefix)));
+            }
+            assertNoLineSeparator(capture);
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_scrollSearch_queryDslLogKeepsLineSeparatorsOfTermsOut() {
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            final SearchEngineClient client = new SearchEngineClient() {
+                {
+                    this.client = this;
+                }
+
+                @Override
+                public SearchRequestBuilder prepareSearch(final String... indices) {
+                    return new SearchRequestBuilder(null, SearchAction.INSTANCE);
+                }
+
+                @Override
+                protected void pitSearch(final String index, final String keepAlive, final String searchTimeout,
+                        final SearchRequestBuilder builder, final BooleanFunction<SearchResponse> pageHandler) {
+                    // nothing to page through
+                }
+            };
+            client.scrollSearch("test", builder -> {
+                builder.setQuery(QueryBuilders.termQuery("role", "g\u2028ERROR forged\u2029x\u0085y"));
+                return true;
+            }, (final Map<String, Object> source) -> true);
+            assertTrue(capture.messagesAt(Level.DEBUG).stream().anyMatch(m -> m.startsWith("Query DSL:")));
+            assertNoLineSeparator(capture);
+        } finally {
+            capture.detach();
+        }
+    }
+
+    private void assertNoLineSeparator(final LogCapturingAppender capture) {
+        final String rendered = String.join("\n", capture.messagesAt(Level.DEBUG));
+        assertTrue(rendered, rendered.contains("ERROR forged"));
+        for (final char c : new char[] { '\u0085', '\u2028', '\u2029' }) {
+            assertFalse("U+" + Integer.toHexString(c) + " reached the log: " + rendered, rendered.indexOf(c) >= 0);
+        }
+    }
+
+    /** A client whose searches fail with the given failure, as the HTTP client reports a request the engine refused. */
+    private SearchEngineClient clientSearchFailingWith(final RuntimeException failure) {
+        return new SearchEngineClient() {
+            {
+                this.client = this;
+            }
+
+            @Override
+            public SearchRequestBuilder prepareSearch(final String... indices) {
+                return new SearchRequestBuilder(this, SearchAction.INSTANCE);
+            }
+
+            @Override
+            public <Request extends ActionRequest, Response extends ActionResponse> ActionFuture<Response> execute(
+                    final ActionType<Response> action, final Request request) {
+                final PlainActionFuture<Response> future = PlainActionFuture.newFuture();
+                future.onFailure(failure);
+                return future;
+            }
+        };
+    }
+
+    @Test
+    public void test_getAccessDeniedAdvice_onlyForAws() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertEquals(" " + AWS_ADVICE, client.getAccessDeniedAdvice(fessConfigOfType("aws")));
+        for (final String type : new String[] { "vanilla", "cloud", "default", "opensearch", "", null }) {
+            assertEquals(String.valueOf(type), "", client.getAccessDeniedAdvice(fessConfigOfType(type)));
+        }
+    }
+
+    @Test
+    public void test_buildUnavailableMessage_refusalPointsToCredentialsAndAccessPolicy() {
+        for (final RestStatus status : new RestStatus[] { RestStatus.UNAUTHORIZED, RestStatus.FORBIDDEN }) {
+            final String message = new SearchEngineClient().buildUnavailableMessage(1500L, new OpenSearchStatusException("x", status, null),
+                    fessConfigOfType("vanilla"));
+
+            assertTrue(message, message.contains("did not become available within 1500ms"));
+            assertTrue(message, message.contains("(" + status.getStatus() + ")"));
+            assertTrue(message, message.contains("search_engine.username and search_engine.password"));
+            assertTrue(message, message.contains("access policy"));
+            assertFalse(message, message.contains("is running"));
+            assertFalse(message, message.contains("fess-setup"));
+            assertFalse(message, message.contains("IAM"));
+        }
+    }
+
+    @Test
+    public void test_buildUnavailableMessage_awsRefusalAddsTheIamAdvice() {
+        for (final RestStatus status : new RestStatus[] { RestStatus.UNAUTHORIZED, RestStatus.FORBIDDEN }) {
+            final String message = new SearchEngineClient().buildUnavailableMessage(1500L, new OpenSearchStatusException("x", status, null),
+                    fessConfigOfType("aws"));
+
+            assertTrue(message, message.endsWith(" permits that user to access it from this host. " + AWS_ADVICE));
+        }
+    }
+
+    @Test
+    public void test_buildUnavailableMessage_otherFailuresKeepTheRunningHint() {
+        for (final Throwable cause : new Throwable[] { new IllegalStateException("Connection refused"),
+                new OpenSearchStatusException("x", RestStatus.SERVICE_UNAVAILABLE, null), new OpenSearchStatusException("x", null, null),
+                null }) {
+            // the aws advice is about a refusal only
+            final String message = new SearchEngineClient().buildUnavailableMessage(10L, cause, fessConfigOfType("aws"));
+
+            assertTrue(message, message.contains("Check that OpenSearch is running and reachable."));
+            assertTrue(message, message.contains("bin/fess-setup install opensearch"));
+            assertFalse(message, message.contains("search_engine.username"));
+            assertFalse(message, message.contains("IAM"));
+        }
+    }
+
+    @Test
+    public void test_waitForYellowStatus_forbiddenWarnsOnceAndPointsToCredentials() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final SearchEngineClient client = clientFailingWith(new OpenSearchStatusException("denied", RestStatus.FORBIDDEN, null));
+        client.setMaxEsStatusRetry(3);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            client.waitForYellowStatus(fessConfigOfType("vanilla"));
+            fail("a refused request must fail the startup");
+        } catch (final ContainerInitFailureException e) {
+            final String message = e.getMessage();
+            assertTrue(message, message.contains("search_engine.username and search_engine.password"));
+            assertTrue(message, message.contains("access policy"));
+            assertFalse(message, message.contains("fess-setup"));
+            assertFalse(message, message.contains("is running"));
+            // three attempts, one warning with the cause
+            final List<String> warnings = capture.messagesOnThisThreadAt(Level.WARN);
+            assertEquals(1, warnings.size());
+            assertTrue(warnings.get(0), warnings.get(0).contains("refused access (HTTP 403)"));
+            assertTrue(warnings.get(0), warnings.get(0).contains("search_engine.username, search_engine.password"));
+            assertFalse(warnings.get(0), warnings.get(0).contains("IAM"));
+            assertEquals(1, capture.eventsOnThisThreadAt(Level.WARN).stream().filter(event -> event.getThrown() != null).toList().size());
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_waitForYellowStatus_unauthorizedWarnsAndPointsToCredentials() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final SearchEngineClient client = clientFailingWith(new OpenSearchStatusException("denied", RestStatus.UNAUTHORIZED, null));
+        client.setMaxEsStatusRetry(1);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            client.waitForYellowStatus(fessConfigOfType("default"));
+            fail("a refused request must fail the startup");
+        } catch (final ContainerInitFailureException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("search_engine.username and search_engine.password"));
+            final List<String> warnings = capture.messagesOnThisThreadAt(Level.WARN);
+            assertEquals(1, warnings.size());
+            assertTrue(warnings.get(0), warnings.get(0).contains("refused access (HTTP 401)"));
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_waitForYellowStatus_awsRefusalAddsTheIamAdviceToTheWarningAndTheFailure() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final SearchEngineClient client = clientFailingWith(new OpenSearchStatusException("denied", RestStatus.FORBIDDEN, null));
+        client.setMaxEsStatusRetry(1);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            client.waitForYellowStatus(fessConfigOfType("aws"));
+            fail("a refused request must fail the startup");
+        } catch (final ContainerInitFailureException e) {
+            assertTrue(e.getMessage(), e.getMessage().endsWith(AWS_ADVICE));
+            final List<String> warnings = capture.messagesOnThisThreadAt(Level.WARN);
+            assertEquals(1, warnings.size());
+            assertTrue(warnings.get(0), warnings.get(0).endsWith(AWS_ADVICE));
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_waitForYellowStatus_aFinalTimeoutDoesNotHideAnEarlierRefusal() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final IllegalStateException timeout = new IllegalStateException("timed out");
+        final SearchEngineClient client = clientFailingWith(new OpenSearchStatusException("denied", RestStatus.FORBIDDEN, null), timeout);
+        client.setMaxEsStatusRetry(2);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            client.waitForYellowStatus(fessConfigOfType("aws"));
+            fail("an engine that never answers must fail the startup");
+        } catch (final ContainerInitFailureException e) {
+            // the message tells about the refusal, the cause is what failed last
+            assertTrue(e.getMessage(), e.getMessage().contains("It refused the request (403)"));
+            assertTrue(e.getMessage(), e.getMessage().endsWith(AWS_ADVICE));
+            assertFalse(e.getMessage(), e.getMessage().contains("is running"));
+            assertSame(timeout, e.getCause());
+            assertEquals(1, capture.messagesOnThisThreadAt(Level.WARN).size());
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_waitForYellowStatus_otherStatusesStayQuietAndKeepTheRunningHint() {
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        // the last one is an error body that carried no status
+        for (final RestStatus status : new RestStatus[] { RestStatus.SERVICE_UNAVAILABLE, null }) {
+            final SearchEngineClient client = clientFailingWith(new OpenSearchStatusException("unavailable", status, null));
+            client.setMaxEsStatusRetry(1);
+            final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+            try {
+                client.waitForYellowStatus(fessConfigOfType("aws"));
+                fail("an unavailable engine must fail the startup");
+            } catch (final ContainerInitFailureException e) {
+                assertTrue(String.valueOf(status), e.getMessage().contains("bin/fess-setup install opensearch"));
+                assertFalse(String.valueOf(status), e.getMessage().contains("IAM"));
+                assertTrue(String.valueOf(status), capture.messagesOnThisThreadAt(Level.WARN).isEmpty());
+            } finally {
+                capture.detach();
+            }
+        }
+    }
+
+    // Test placeholder for future implementation
+    @Test
+    public void test_placeholder() {
+        // This test verifies the test class can be instantiated and run
+        String testValue = "test";
+        assertNotNull(testValue);
+        assertEquals("test", testValue);
+    }
+
+    /**
+     * A client reporting the given backend, recording whether the unsupported-engine report fired.
+     */
+    private SearchEngineClient clientReporting(final String distribution, final String number, final AtomicInteger reports) {
+        return new SearchEngineClient() {
+            @Override
+            public EngineInfo getEngineInfo() {
+                return new EngineInfo(Map.of("version", Map.of("number", number, "distribution", distribution)));
+            }
+
+            @Override
+            protected void reportUnsupportedEngine(final EngineInfo.EngineType engineType) {
+                reports.incrementAndGet();
+            }
+        };
+    }
+
+    /**
+     * OpenSearch 3.x is what Fess needs, so startup must stay quiet.
+     */
+    @Test
+    public void test_verifyEngineVersion_quietOnOpenSearch3() {
+        final AtomicInteger reports = new AtomicInteger(0);
+        clientReporting("opensearch", "3.8.0", reports).verifyEngineVersion();
+        assertEquals(0, reports.get());
+    }
+
+    /**
+     * OpenSearch 2.x cannot sort by _shard_doc, so startup must be refused.
+     */
+    @Test
+    public void test_verifyEngineVersion_reportsOpenSearch2() {
+        final AtomicInteger reports = new AtomicInteger(0);
+        clientReporting("opensearch", "2.19.4", reports).verifyEngineVersion();
+        assertEquals(1, reports.get());
+    }
+
+    /**
+     * Elasticsearch has no _shard_doc sort either, so it is refused the same way.
+     */
+    @Test
+    public void test_verifyEngineVersion_reportsElasticsearch() {
+        final AtomicInteger reports = new AtomicInteger(0);
+        clientReporting("elasticsearch", "8.11.0", reports).verifyEngineVersion();
+        assertEquals(1, reports.get());
+    }
+
+    /**
+     * An engine that cannot be identified is not a mismatch: the connection failure surfaces
+     * on its own, so this check must stay out of the way.
+     */
+    @Test
+    public void test_verifyEngineVersion_survivesUndetectableEngine() {
+        final AtomicInteger reports = new AtomicInteger(0);
+        new SearchEngineClient() {
+            @Override
+            public EngineInfo getEngineInfo() {
+                throw new IllegalStateException("client is not HttpClient.");
+            }
+
+            @Override
+            protected void reportUnsupportedEngine(final EngineInfo.EngineType engineType) {
+                reports.incrementAndGet();
+            }
+        }.verifyEngineVersion();
+        assertEquals(0, reports.get());
+    }
+
+    /**
+     * A point in time opened on an alias covers every index behind it, and _shard_doc restarts per
+     * index -- the same value shows up in several of them. search_after asks for values strictly
+     * greater than the last one on the page, so without a second key a page ending on a repeated
+     * value silently drops whatever another index still holds at or below it. The index name is
+     * therefore sorted on as well.
+     */
+    @Test
+    public void test_pitSearch_ordersByIndexAfterShardDoc() throws Exception {
+        final List<SearchRequest> searches = new ArrayList<>();
+        final SearchEngineClient client = pitStub(searches, "pit-1");
+
+        client.pitSearch("fess_config", "1m", "10s", new SearchRequestBuilder(client, SearchAction.INSTANCE), response -> true);
+
+        assertEquals(1, searches.size());
+        final List<SortBuilder<?>> sorts = searches.get(0).source().sorts();
+        assertNotNull(sorts);
+        assertTrue(sorts.size() >= 2);
+        assertEquals("_shard_doc", sorts.get(sorts.size() - 2).getWriteableName());
+        final SortBuilder<?> last = sorts.get(sorts.size() - 1);
+        assertTrue(last instanceof FieldSortBuilder);
+        assertEquals("_index", ((FieldSortBuilder) last).getFieldName());
+        assertEquals(SortOrder.ASC, ((FieldSortBuilder) last).order());
+    }
+
+    /**
+     * A closed or otherwise unavailable index answers the create request with no identifier instead
+     * of an error. Building the point in time from that null used to fail with a bare
+     * NullPointerException, which said nothing about which index was at fault.
+     */
+    @Test
+    public void test_pitSearch_reportsAMissingPitId() throws Exception {
+        final List<SearchRequest> searches = new ArrayList<>();
+        final SearchEngineClient client = pitStub(searches, null);
+
+        try {
+            client.pitSearch("fess_config", "1m", "10s", new SearchRequestBuilder(client, SearchAction.INSTANCE), response -> true);
+            fail("a missing point in time must be reported");
+        } catch (final SearchEngineClientException e) {
+            assertTrue(e.getMessage().contains("fess_config"));
+        }
+        assertTrue(searches.isEmpty());
+    }
+
+    /**
+     * A client whose create-point-in-time answers with the given identifier and whose searches
+     * always come back empty, so a walk ends after one page.
+     */
+    private SearchEngineClient pitStub(final List<SearchRequest> searches, final String pitId) {
+        return new SearchEngineClient() {
+            {
+                // pitSearch talks to the delegate; point it back at this instance so the overrides
+                // below are the ones that answer.
+                this.client = this;
+            }
+
+            @Override
+            public void deletePits(final DeletePitRequest request, final ActionListener<DeletePitResponse> listener) {
+                listener.onResponse(new DeletePitResponse(List.of()));
+            }
+
+            @SuppressWarnings("unchecked")
+            @Override
+            public <Request extends ActionRequest, Response extends ActionResponse> ActionFuture<Response> execute(
+                    final ActionType<Response> action, final Request request) {
+                final PlainActionFuture<Response> future = PlainActionFuture.newFuture();
+                if (CreatePitAction.INSTANCE.equals(action)) {
+                    future.onResponse(
+                            (Response) new CreatePitResponse(pitId, System.currentTimeMillis(), 1, 1, 0, 0, new ShardSearchFailure[0]));
+                } else if (SearchAction.INSTANCE.equals(action)) {
+                    searches.add((SearchRequest) request);
+                    try {
+                        future.onResponse((Response) responseWithIds());
+                    } catch (final Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                } else {
+                    future.onResponse(null);
+                }
+                return future;
+            }
+        };
+    }
+
+    /**
+     * Builds a SearchResponse holding one hit per given id, as if it came back over HTTP. Each hit
+     * carries a sort value so that the pager can derive its next search_after.
+     */
+    private SearchResponse responseWithIds(final String... ids) throws Exception {
+        final StringBuilder buf = new StringBuilder();
+        buf.append("{\"took\":1,\"timed_out\":false,\"_shards\":{\"total\":1,\"successful\":1,\"skipped\":0,\"failed\":0},");
+        buf.append("\"hits\":{\"total\":{\"value\":").append(ids.length).append(",\"relation\":\"eq\"},\"max_score\":null,\"hits\":[");
+        for (int i = 0; i < ids.length; i++) {
+            if (i > 0) {
+                buf.append(',');
+            }
+            buf.append("{\"_index\":\"test\",\"_id\":\"").append(ids[i]).append("\",\"_score\":null,");
+            buf.append("\"_source\":{\"doc_id\":\"").append(ids[i]).append("\"},\"sort\":[").append(i + 1).append("]}");
+        }
+        buf.append("]}}");
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(NamedXContentRegistry.EMPTY,
+                DeprecationHandler.IGNORE_DEPRECATIONS, buf.toString())) {
+            return SearchResponse.fromXContent(parser);
+        }
+    }
+
+    /**
+     * A cursor returning false must end the whole walk, not just the current page. Before this was
+     * fixed the pager kept fetching further pages after the cursor had asked to stop.
+     */
+    @Test
+    public void test_scrollSearch_cursorReturningFalseStopsTheWalk() throws Exception {
+        final AtomicInteger pagesOffered = new AtomicInteger(0);
+        final SearchResponse page1 = responseWithIds("1", "2");
+        final SearchResponse page2 = responseWithIds("3", "4");
+        final SearchEngineClient client = new SearchEngineClient() {
+            {
+                // scrollSearch builds its request through the delegate; point it back at this
+                // instance so the overridden prepareSearch below is the one that answers.
+                this.client = this;
+            }
+
+            @Override
+            public SearchRequestBuilder prepareSearch(final String... indices) {
+                // The pager is stubbed out below, so the builder is never executed.
+                return new SearchRequestBuilder(null, SearchAction.INSTANCE);
+            }
+
+            @Override
+            protected void pitSearch(final String index, final String keepAlive, final String searchTimeout,
+                    final SearchRequestBuilder builder, final BooleanFunction<SearchResponse> pageHandler) {
+                for (final SearchResponse page : new SearchResponse[] { page1, page2 }) {
+                    pagesOffered.incrementAndGet();
+                    if (!pageHandler.apply(page)) {
+                        return;
+                    }
+                }
+            }
+        };
+
+        final List<String> seen = new ArrayList<>();
+        final long count = client.scrollSearch("test", requestBuilder -> true, (response, hit) -> hit.getSourceAsMap(),
+                (final Map<String, Object> source) -> {
+                    seen.add((String) source.get("doc_id"));
+                    return false;
+                });
+
+        assertEquals(1, pagesOffered.get());
+        assertEquals(1, seen.size());
+        assertEquals("1", seen.get(0));
+        assertEquals(1L, count);
+    }
+
+    /**
+     * A cursor that keeps returning true must be offered every page.
+     */
+    @Test
+    public void test_scrollSearch_cursorReturningTrueWalksEveryPage() throws Exception {
+        final AtomicInteger pagesOffered = new AtomicInteger(0);
+        final SearchResponse page1 = responseWithIds("1", "2");
+        final SearchResponse page2 = responseWithIds("3", "4");
+        final SearchEngineClient client = new SearchEngineClient() {
+            {
+                // scrollSearch builds its request through the delegate; point it back at this
+                // instance so the overridden prepareSearch below is the one that answers.
+                this.client = this;
+            }
+
+            @Override
+            public SearchRequestBuilder prepareSearch(final String... indices) {
+                // The pager is stubbed out below, so the builder is never executed.
+                return new SearchRequestBuilder(null, SearchAction.INSTANCE);
+            }
+
+            @Override
+            protected void pitSearch(final String index, final String keepAlive, final String searchTimeout,
+                    final SearchRequestBuilder builder, final BooleanFunction<SearchResponse> pageHandler) {
+                for (final SearchResponse page : new SearchResponse[] { page1, page2 }) {
+                    pagesOffered.incrementAndGet();
+                    if (!pageHandler.apply(page)) {
+                        return;
+                    }
+                }
+            }
+        };
+
+        final List<String> seen = new ArrayList<>();
+        final long count = client.scrollSearch("test", requestBuilder -> true, (response, hit) -> hit.getSourceAsMap(),
+                (final Map<String, Object> source) -> {
+                    seen.add((String) source.get("doc_id"));
+                    return true;
+                });
+
+        assertEquals(2, pagesOffered.get());
+        assertEquals(List.of("1", "2", "3", "4"), seen);
+        assertEquals(4L, count);
+    }
+
+    @Test
+    public void test_clampFacetSize() {
+        assertEquals(0, SearchEngineClient.clampFacetSize(-5, 1000));
+        assertEquals(500, SearchEngineClient.clampFacetSize(500, 1000));
+        assertEquals(1000, SearchEngineClient.clampFacetSize(5000, 1000));
+    }
+
+    @Test
+    public void test_clampMinDocCount_withMax() {
+        assertEquals(0L, SearchEngineClient.clampMinDocCount(-1L, 100L));
+        assertEquals(50L, SearchEngineClient.clampMinDocCount(50L, 100L));
+        assertEquals(100L, SearchEngineClient.clampMinDocCount(5000L, 100L));
+        assertEquals(100L, SearchEngineClient.clampMinDocCount(100L, 100L));
+    }
+
+    @Test
+    public void test_isStartupBulkReloadTarget() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertTrue(client.isStartupBulkReloadTarget("fess_config.scheduled_job"));
+        assertFalse(client.isStartupBulkReloadTarget("fess_config.label_type"));
+        assertFalse(client.isStartupBulkReloadTarget("fess_config.web_config"));
+        assertFalse(client.isStartupBulkReloadTarget("fess_user.user"));
+        assertFalse(client.isStartupBulkReloadTarget("fess_log.click_log"));
+        assertFalse(client.isStartupBulkReloadTarget(null));
+    }
+
+    @Test
+    public void test_isWebappProcess_trueWhenNoJobProcessMarkerIsSet() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertTrue(client.isWebappProcess(), "the webapp process itself sets none of the fess.<type>.process markers");
+    }
+
+    @Test
+    public void test_isWebappProcess_falseWhenAnyJobProcessMarkerIsSet() {
+        // IMPORTANT 3 regression test: each of the four child-process types that also boot app.xml
+        // (and therefore also run SearchEngineClient#open) must be recognized so the startup bulk
+        // reload (isStartupBulkReloadTarget) does not re-run in them -- most notably
+        // ThumbnailGenerator, whose job is scheduled every minute by default.
+        final SearchEngineClient client = new SearchEngineClient();
+        final String[] processProperties =
+                { "fess.crawler.process", "fess.thumbnail.process", "fess.suggest.process", "fess.chunk.process" };
+        for (final String property : processProperties) {
+            System.setProperty(property, "true");
+            try {
+                assertFalse(client.isWebappProcess(), property + "=true must not be treated as the webapp process");
+            } finally {
+                System.clearProperty(property);
+            }
+        }
+    }
+
+    @Test
+    public void test_isWebappProcess_trueWhenJobProcessMarkerIsNotLiterallyTrue() {
+        // addSystemProperty only ever writes "true" for these markers, but the check itself
+        // must not accidentally treat any non-blank value as truthy.
+        final SearchEngineClient client = new SearchEngineClient();
+        System.setProperty("fess.thumbnail.process", "false");
+        try {
+            assertTrue(client.isWebappProcess());
+        } finally {
+            System.clearProperty("fess.thumbnail.process");
+        }
+    }
+
+    @Test
+    public void test_createIndex_failureLogsTheReasonInTheWarning() {
+        final SearchEngineClient client = new SearchEngineClient() {
+            @Override
+            protected String readIndexSetting(final String index, final String fesenType, final String indexConfigFile,
+                    final String numberOfShards, final String autoExpandReplicas) {
+                throw new IllegalArgumentException("failed to parse mapping",
+                        new IllegalStateException("match \"ZQEXp\" was already added"));
+            }
+        };
+        final LogCapturingAppender capture = LogCapturingAppender.attach(SearchEngineClient.class);
+        try {
+            assertFalse(client.createIndex("fess", "fess.20260101", "1", "0-1", false));
+            final List<String> warnings = capture.messagesOnThisThreadAt(Level.WARN);
+            assertEquals(1, warnings.size());
+            final String warning = warnings.get(0);
+            assertTrue(warning, warning.startsWith("Failed to create index: index=fess, path="));
+            assertTrue(warning, warning.contains("fess_indices/fess.json"));
+            assertTrue(warning, warning.contains("reason=failed to parse mapping; root cause: match \"ZQEXp\" was already added"));
+            // the level and the stack trace are kept
+            assertEquals(1, capture.eventsOnThisThreadAt(Level.WARN).stream().filter(event -> event.getThrown() != null).count());
+        } finally {
+            capture.detach();
+        }
+    }
+
+    @Test
+    public void test_getFailureReason() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertEquals("boom", client.getFailureReason(new RuntimeException("boom")));
+        assertEquals("null", client.getFailureReason(new RuntimeException()));
+        assertEquals("top; root cause: bottom",
+                client.getFailureReason(new RuntimeException("top", new IllegalStateException("middle", new Exception("bottom")))));
+        // the same message is not repeated, and a root cause without a message adds nothing
+        assertEquals("same", client.getFailureReason(new RuntimeException("same", new Exception("same"))));
+        assertEquals("top", client.getFailureReason(new RuntimeException("top", new Exception())));
+    }
+
+    @Test
+    public void test_isMissingKnnPluginError_detectsUnknownIndexKnnSetting() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertTrue(client.isMissingKnnPluginError(new IllegalStateException("unknown setting [index.knn] for index [fess.20260101]")));
+    }
+
+    @Test
+    public void test_isMissingKnnPluginError_detectsMissingKnnVectorTypeHandler() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertTrue(client.isMissingKnnPluginError(new IllegalArgumentException("No handler for type [knn_vector] declared on field")));
+    }
+
+    @Test
+    public void test_isMissingKnnPluginError_walksCauseChain() {
+        final SearchEngineClient client = new SearchEngineClient();
+        final Exception wrapped = new RuntimeException("index creation failed",
+                new IllegalStateException("unknown setting [index.knn] for index [fess.20260101]"));
+
+        assertTrue(client.isMissingKnnPluginError(wrapped), "the diagnostic must inspect the full cause chain, not just the top exception");
+    }
+
+    @Test
+    public void test_isMissingKnnPluginError_falseForUnrelatedFailure() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        assertFalse(client.isMissingKnnPluginError(new RuntimeException("connection refused")));
+    }
+
+    @Test
+    public void test_reportUnsupportedEngine_abortsStartup() {
+        final SearchEngineClient client = new SearchEngineClient();
+
+        for (final EngineType engineType : new EngineType[] { EngineType.OPENSEARCH2, EngineType.OPENSEARCH1, EngineType.ELASTICSEARCH8,
+                EngineType.ELASTICSEARCH7, EngineType.UNKNOWN }) {
+            final FessSystemException e = org.junit.jupiter.api.Assertions.assertThrows(FessSystemException.class,
+                    () -> client.reportUnsupportedEngine(engineType));
+            assertTrue(e.getMessage().contains("OpenSearch 3"), e.getMessage());
+            assertTrue(e.getMessage().contains(engineType.toString()), e.getMessage());
+        }
+    }
+
+    /**
+     * fess.json concatenates this value with a relative file name, so a missing trailing
+     * separator turns .../dictionary into .../dictionaryar/protwords.txt and index creation
+     * fails with "file not readable".
+     */
+    @Test
+    public void test_resolveDictionaryPath_addsTrailingSeparator() {
+        final String original = System.getProperty("fess.dictionary.path");
+        try {
+            System.setProperty("fess.dictionary.path", "/usr/share/opensearch/config/dictionary");
+            new SearchEngineClient().resolveDictionaryPath(org.codelibs.fess.util.ComponentUtil.getFessConfig());
+            assertEquals("/usr/share/opensearch/config/dictionary/", System.getProperty("fess.dictionary.path"));
+        } finally {
+            if (original == null) {
+                System.clearProperty("fess.dictionary.path");
+            } else {
+                System.setProperty("fess.dictionary.path", original);
+            }
+        }
+    }
+
+    @Test
+    public void test_resolveDictionaryPath_keepsExistingSeparator() {
+        final String original = System.getProperty("fess.dictionary.path");
+        try {
+            System.setProperty("fess.dictionary.path", "/var/lib/opensearch/config/");
+            new SearchEngineClient().resolveDictionaryPath(org.codelibs.fess.util.ComponentUtil.getFessConfig());
+            assertEquals("/var/lib/opensearch/config/", System.getProperty("fess.dictionary.path"));
+        } finally {
+            if (original == null) {
+                System.clearProperty("fess.dictionary.path");
+            } else {
+                System.setProperty("fess.dictionary.path", original);
+            }
+        }
+    }
+
+    @Test
+    public void test_resolveDictionaryPath_leavesUnsetValueAlone() {
+        final String original = System.getProperty("fess.dictionary.path");
+        try {
+            System.clearProperty("fess.dictionary.path");
+            new SearchEngineClient().resolveDictionaryPath(org.codelibs.fess.util.ComponentUtil.getFessConfig());
+            assertNull(System.getProperty("fess.dictionary.path"));
+        } finally {
+            if (original == null) {
+                System.clearProperty("fess.dictionary.path");
+            } else {
+                System.setProperty("fess.dictionary.path", original);
+            }
+        }
+    }
+
+}

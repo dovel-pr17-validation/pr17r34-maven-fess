@@ -1,0 +1,142 @@
+/*
+ * Copyright 2012-2025 CodeLibs Project and the Others.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+package org.codelibs.fess.query;
+
+import static org.codelibs.core.stream.StreamUtil.stream;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.PhraseQuery;
+import org.apache.lucene.search.Query;
+import org.codelibs.fess.Constants;
+import org.codelibs.fess.entity.QueryContext;
+import org.codelibs.fess.exception.InvalidQueryException;
+import org.codelibs.fess.mylasta.direction.FessConfig;
+import org.codelibs.fess.util.ComponentUtil;
+import org.lastaflute.core.message.UserMessages;
+import org.codelibs.fesen.opensearch.index.query.MatchPhraseQueryBuilder;
+import org.codelibs.fesen.opensearch.index.query.QueryBuilder;
+import org.codelibs.fesen.opensearch.index.query.QueryBuilders;
+
+/**
+ * Query command for phrase queries.
+ */
+public class PhraseQueryCommand extends QueryCommand {
+
+    /**
+     * Default constructor.
+     */
+    public PhraseQueryCommand() {
+    }
+
+    private static final Logger logger = LogManager.getLogger(PhraseQueryCommand.class);
+
+    @Override
+    protected String getQueryClassName() {
+        return PhraseQuery.class.getSimpleName();
+    }
+
+    @Override
+    public QueryBuilder execute(final QueryContext context, final Query query, final float boost) {
+        if (query instanceof final PhraseQuery phraseQuery) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("PhraseQuery: query={}, boost={}", query, boost);
+            }
+            return convertPhraseQuery(context, phraseQuery, boost);
+        }
+        throw new InvalidQueryException(messages -> messages.addErrorsInvalidQueryUnknown(UserMessages.GLOBAL_PROPERTY_KEY),
+                "Unknown q: " + query.getClass() + " => " + query);
+    }
+
+    /**
+     * Converts a phrase query to a query builder.
+     *
+     * @param context the query context
+     * @param phraseQuery the phrase query
+     * @param boost the boost factor
+     * @return the query builder
+     */
+    protected QueryBuilder convertPhraseQuery(final QueryContext context, final PhraseQuery phraseQuery, final float boost) {
+        final Term[] terms = phraseQuery.getTerms();
+        if (terms.length == 0) {
+            throw new InvalidQueryException(messages -> messages.addErrorsInvalidQueryUnknown(UserMessages.GLOBAL_PROPERTY_KEY),
+                    "Unknown phrase query: " + phraseQuery);
+        }
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        final String field = terms[0].field();
+        final String[] texts = stream(terms).get(stream -> stream.map(Term::text).toArray(n -> new String[n]));
+
+        return convertPhraseQuery(fessConfig, context, phraseQuery, boost, field, texts);
+    }
+
+    /**
+     * Converts a phrase query to a query builder with specified field and texts.
+     *
+     * @param fessConfig the Fess configuration
+     * @param context the query context
+     * @param phraseQuery the phrase query
+     * @param boost the boost factor
+     * @param field the field name
+     * @param texts the query texts
+     * @return the query builder
+     */
+    protected QueryBuilder convertPhraseQuery(final FessConfig fessConfig, final QueryContext context, final PhraseQuery phraseQuery,
+            final float boost, final String field, final String[] texts) {
+        final String text = String.join(" ", texts);
+        final int slop = phraseQuery.getSlop();
+
+        if (isRestrictedTagField(context, field)) {
+            if (texts.length != 1 || !isVisibleTag(context, texts[0])) {
+                return buildHiddenTagQuery(context, field, text);
+            }
+            context.addFieldLog(field, text);
+            return QueryBuilders.termQuery(field, texts[0]).boost(boost);
+        }
+
+        if (Constants.DEFAULT_FIELD.equals(field)) {
+            context.addFieldLog(field, text);
+            stream(texts).of(stream -> stream.forEach(t -> context.addHighlightedQuery(t)));
+            return buildDefaultQueryBuilder(fessConfig, context, (f, b) -> buildMatchPhraseQuery(f, text, slop).boost(b * boost));
+        }
+
+        if (isSearchField(field)) {
+            context.addFieldLog(field, text);
+            stream(texts).of(stream -> stream.forEach(t -> context.addHighlightedQuery(t)));
+            return buildMatchPhraseQuery(field, text, slop);
+        }
+
+        context.addFieldLog(Constants.DEFAULT_FIELD, text);
+        return buildDefaultQueryBuilder(fessConfig, context, (f, b) -> buildMatchPhraseQuery(f, text, slop).boost(b * boost));
+    }
+
+    /**
+     * Builds a match phrase query that keeps the slop of a proximity search such as {@code "word1 word2"~N}.
+     *
+     * @param f the field name
+     * @param text the query text
+     * @param slop the number of positions the terms may be apart
+     * @return the query builder
+     */
+    protected QueryBuilder buildMatchPhraseQuery(final String f, final String text, final int slop) {
+        final QueryBuilder queryBuilder = buildMatchPhraseQuery(f, text);
+        if (slop > 0 && queryBuilder instanceof final MatchPhraseQueryBuilder matchPhraseQuery) {
+            matchPhraseQuery.slop(slop);
+        }
+        return queryBuilder;
+    }
+
+}
